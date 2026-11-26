@@ -534,7 +534,9 @@ pub fn translate_program(
 const MIN_SECTION_COPIES: usize = 256;
 
 /// The rounds [`ir::whole_sections`] gets: a join's code taken into its
-/// arms may end in another section's split start.
+/// arms may end in another section's split start, and a chain of split
+/// sections is joined one link per round from its end (a chain of up to
+/// five blocks; the shared ends seen need one round).
 const SECTION_ROUNDS: usize = 4;
 
 /// The instructions of `p`.
@@ -946,6 +948,67 @@ mod tests {
         let (q, rounds, copied) = super::joined_sections(&p, 10);
         assert!(q.is_some(), "joined at the bound");
         assert_eq!((rounds, copied), (1, 10));
+    }
+
+    /// A chain of sections: block A starts one and jumps to B, B restores
+    /// it and starts another and jumps to C, C restores that and stores.
+    fn chained_sections() -> crate::ir::Program {
+        let words = [
+            0xBE8C_25C1, // A: s_or_saveexec_b64 s[12:13], -1
+            0xBF82_0000, // s_branch to B
+            0xBEFE_040C, // B: s_mov_b64 exec, s[12:13]
+            0xBE8E_25C1, // s_or_saveexec_b64 s[14:15], -1
+            0xBF82_0000, // s_branch to C
+            0xBEFE_040E, // C: s_mov_b64 exec, s[14:15]
+            0x7E00_020E, // v_mov_b32 v0, s14
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect();
+        crate::ir::build(&code, true, 8).expect("ir::build")
+    }
+
+    /// The `buffer_store_dword`s reachable from the entry of `p`.
+    fn reachable_stores(p: &crate::ir::Program) -> usize {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut work = vec![0];
+        let mut stores = 0;
+        while let Some(b) = work.pop() {
+            if std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            let block = &p.blocks[b];
+            stores += block.insts.iter().filter(|i| i.name() == "buffer_store_dword").count();
+            work.extend(block.exit.successors());
+        }
+        stores
+    }
+
+    /// A join whose code an arm takes is not emptied in the same round by
+    /// taking its own join's code: the chain's store stays reachable, and
+    /// both sections end up in the first block.
+    #[test]
+    fn a_chain_of_split_sections_keeps_its_store() {
+        let p = chained_sections();
+        assert_eq!(p.blocks.len(), 3);
+        assert_eq!(reachable_stores(&p), 1);
+        let sections = |p: &crate::ir::Program| {
+            (0..p.blocks.len()).map(|b| super::wave::sections(p, b).len()).sum::<usize>()
+        };
+        assert_eq!(sections(&p), 0);
+        let mut q = p.clone();
+        while let Ok(Some((next, _))) = crate::ir::whole_sections(&q, usize::MAX) {
+            assert_eq!(reachable_stores(&next), 1, "a round lost the store");
+            q = next;
+        }
+        let (j, rounds, copied) = super::joined_sections(&p, usize::MAX);
+        let j = j.expect("sections to join");
+        assert_eq!(reachable_stores(&j), 1);
+        assert_eq!(super::wave::sections(&j, 0).len(), 2, "both sections in the entry block");
+        assert_eq!(rounds, 2, "one link of the chain per round, from its end");
+        assert_eq!(copied, 4 + 6, "C's four into B, then B's restore, start and those four into A");
+        crate::structure::structure(&j).expect("the joined program structures");
     }
 
     #[test]

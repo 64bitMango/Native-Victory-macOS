@@ -390,6 +390,13 @@ pub(crate) fn whole_sections(p: &Program, budget: usize) -> Result<Option<(Progr
             fuse.push((b, join));
         }
     }
+    // A join that takes its own join's code this round is left for the
+    // next: an arm taking its code now would take the code before that
+    // (and jump to a join this round may empty). The fusion with the
+    // latest join in reverse postorder always stays, so each round makes
+    // progress, and a chain is joined from its end, one link per round.
+    let fusers: Vec<usize> = fuse.iter().map(|&(b, _)| b).collect();
+    fuse.retain(|&(_, join)| !fusers.contains(&join));
     if fuse.is_empty() {
         return Ok(None);
     }
@@ -407,12 +414,21 @@ pub(crate) fn whole_sections(p: &Program, budget: usize) -> Result<Option<(Progr
         blocks[b].exit = p.blocks[join].exit;
     }
     // A join whose every way in took its code is left: nothing reaches it.
+    let mut emptied = vec![false; blocks.len()];
     for &(_, join) in &fuse {
         if p.blocks[join].preds.iter().all(|q| fuse.contains(&(*q, join))) {
             blocks[join].insts.clear();
             blocks[join].exit = Exit::End;
+            emptied[join] = true;
         }
     }
+    debug_assert!(
+        blocks
+            .iter()
+            .enumerate()
+            .all(|(b, block)| emptied[b] || block.exit.successors().iter().all(|&s| !emptied[s])),
+        "a join left a jump to a block it emptied"
+    );
     link(&mut blocks);
     if split_irreducible(&mut blocks).is_err() {
         return Ok(None);
