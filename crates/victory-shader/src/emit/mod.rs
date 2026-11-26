@@ -510,6 +510,7 @@ pub fn translate_program(
     })();
     let digest = Digest(&c.digest);
     match (&made, &again) {
+        _ if !join_log() => {}
         (Ok(_), Ok(_)) => tracing::info!(
             %digest, stage = ?native.stage, rounds, copied,
             "a translation that succeeded is replaced: a lane permute outside the whole-wave \
@@ -548,7 +549,8 @@ fn instructions(p: &ir::Program) -> usize {
 /// ([`ir::whole_sections`], up to [`SECTION_ROUNDS`] rounds, at most `limit`
 /// instructions copied in all), the rounds that ran and the
 /// instructions copied; `None` if no round changed anything. A round that
-/// would copy past the bound is not made (logged), the rounds before it
+/// would copy past the bound is not made (logged with
+/// `VICTORY_SHADER_JOIN_LOG=1`, [`join_log`]), the rounds before it
 /// kept.
 fn joined_sections(p: &ir::Program, limit: usize) -> (Option<ir::Program>, usize, usize) {
     let size = instructions(p);
@@ -562,15 +564,27 @@ fn joined_sections(p: &ir::Program, limit: usize) -> (Option<ir::Program>, usize
             }
             Ok(None) => break,
             Err(n) => {
-                tracing::info!(
-                    size, limit, copied, round = rounds + 1, would_copy = n,
-                    "whole-wave sections a jump splits left split: joining them copies too much"
-                );
+                if join_log() {
+                    tracing::info!(
+                        size, limit, copied, round = rounds + 1, would_copy = n,
+                        "whole-wave sections a jump splits left split: joining them copies too much"
+                    );
+                }
                 break;
             }
         }
     }
     (q, rounds, copied)
+}
+
+/// Debugging (`VICTORY_SHADER_JOIN_LOG=1`, off by default): log the
+/// translations [`translate_program`] makes with the whole-wave sections a
+/// jump splits joined (one that replaces a translation that succeeded, a
+/// rescued refusal, a retry that fails) and the rounds the copy bound
+/// skips. Read once.
+fn join_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SHADER_JOIN_LOG").as_deref() == Ok("1"))
 }
 
 /// A container digest in hex, for logs.
