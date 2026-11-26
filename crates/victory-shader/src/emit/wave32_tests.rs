@@ -96,6 +96,40 @@ const DIVERGENT_BALLOT: &[u32] = &[
     S_ENDPGM,
 ];
 
+/// LDS written and read under a per-lane branch.
+const WRITE_READ_DIVERGENT: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0xBE80_047E, // s_mov_b64 s[0:1], exec
+    0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+    skip_execz(4),
+    0xD834_0000,
+    0x0000_0001, // ds_write_b32 v1, v0
+    0xD8D8_0004,
+    0x0200_0001, // ds_read_b32 v2, v1 offset:4
+    0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+    S_ENDPGM,
+];
+
+/// LDS written, then read where every lane is.
+const WRITE_THEN_READ: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0xD834_0000,
+    0x0000_0001, // ds_write_b32 v1, v0
+    0xD8D8_0004,
+    0x0200_0001, // ds_read_b32 v2, v1 offset:4
+    S_ENDPGM,
+];
+
+/// `v_permlane16_b32` and `v_permlanex16_b32`, inside each 32-lane half.
+const PERMLANES: &[u32] = &[
+    0xD777_0802,
+    0x0201_0100, // v_permlane16_b32 v2, v0, 0, 0 fi:1
+    0xD778_0803,
+    0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi:1
+    0x7E0A_0303, // v_mov_b32_e32 v5, v3
+    S_ENDPGM,
+];
+
 /// Lowers `words` as a wave64 compute program of `lanes` threads (512 bytes
 /// of LDS if `lds`).
 fn lowered(
@@ -220,29 +254,9 @@ fn exchanges_wait_for_every_thread_to_arrive() {
 #[test]
 fn lds_a_wave_shares_unsynced_in_divergent_code_is_refused() {
     // Write and read both under the branch: no barrier can go there.
-    const WRITE_READ_DIVERGENT: &[u32] = &[
-        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
-        0xBE80_047E, // s_mov_b64 s[0:1], exec
-        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
-        skip_execz(4),
-        0xD834_0000,
-        0x0000_0001, // ds_write_b32 v1, v0
-        0xD8D8_0004,
-        0x0200_0001, // ds_read_b32 v2, v1 offset:4
-        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
-        S_ENDPGM,
-    ];
     let r = lowered(WRITE_READ_DIVERGENT, 64, true, true);
     assert!(matches!(r, Err(crate::ShaderError::Unsupported { .. })));
     // Where a barrier fits it is added, and no 64-lane wave is asked for.
-    const WRITE_THEN_READ: &[u32] = &[
-        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
-        0xD834_0000,
-        0x0000_0001, // ds_write_b32 v1, v0
-        0xD8D8_0004,
-        0x0200_0001, // ds_read_b32 v2, v1 offset:4
-        S_ENDPGM,
-    ];
     let l = lowered(WRITE_THEN_READ, 64, true, true).unwrap();
     assert_eq!(l.wave_size, None);
     assert_eq!(l.barriers, 1);
@@ -288,16 +302,137 @@ fn a_whole_wave_sum_combines_the_two_halves() {
 fn permlane16_and_permlanex16_lower_within_host32_half() {
     // v_permlane16_b32 v2, v0, 0, 0 fi:1 (op 0x377, opsel=1 -> 0xD777_0802)
     // v_permlanex16_b32 v3, v2, -1, -1 fi:1 (op 0x378, opsel=1 -> 0xD778_0803)
-    const PROG: &[u32] = &[
-        0xD777_0802,
-        0x0201_0100, // v_permlane16_b32 v2, v0, 0, 0 fi:1
-        0xD778_0803,
-        0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi:1
-        0x7E0A_0303, // v_mov_b32_e32 v5, v3
-        S_ENDPGM,
-    ];
-    let l = host32(PROG, 64);
+    let l = host32(PERMLANES, 64);
     assert_eq!(l.wave_size, Some(32));
     // Both stay within the 32-lane half, so no cross-half LDS exchange barriers are needed.
     assert_eq!(l.barriers, 0);
+}
+
+/// Every program here, translated for the native host (`emit_with`, 32-lane
+/// waves) with the walk (`Options::no_wave_walk` unset) and without it, in
+/// groups of 32, 64 and 128 lanes, with and without LDS: what is made
+/// without the walk is made byte for byte the same with it (the walk runs
+/// only after a refusal).
+#[test]
+fn programs_made_without_the_walk_are_the_same_with_it() {
+    use super::{Options, emit_with};
+    let emitted = |words: &[u32], lanes: u32, lds: bool, walk: bool| {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: u32::from(lds) << 15 | 2 << 1,
+                threads: [lanes, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = crate::dxbc::Container::parse(&bytes).unwrap();
+        let options = Options {
+            wave32_host: true,
+            zero_copy_memory: true,
+            no_wave_walk: !walk,
+            ..Options::default()
+        };
+        emit_with(&c, &native, &p, &st, &io, &res, options)
+    };
+    let programs = [
+        BALLOT,
+        READLANE,
+        BPERMUTE,
+        IN_HALF,
+        DIVERGENT_READLANE,
+        UNIFORM_BRANCH_READLANE,
+        DIVERGENT_BALLOT,
+        REDUCE,
+        WRITE_READ_DIVERGENT,
+        WRITE_THEN_READ,
+        PERMLANES,
+    ];
+    let mut same = 0;
+    for (n, words) in programs.into_iter().enumerate() {
+        for lanes in [32, 64, 128] {
+            for lds in [false, true] {
+                let Ok(without) = emitted(words, lanes, lds, false) else {
+                    continue;
+                };
+                let with = emitted(words, lanes, lds, true)
+                    .unwrap_or_else(|e| panic!("program {n}, {lanes} lanes: {e}"));
+                assert!(
+                    with.dxil == without.dxil,
+                    "program {n}, {lanes} lanes, LDS {lds}: not the same"
+                );
+                same += 1;
+            }
+        }
+    }
+    // (none skipped unnoticed: those made without the walk)
+    assert_eq!(same, 59, "made without the walk");
+}
+
+/// A loop the wave goes round 4 times, in which lanes with v0 = 1 leave
+/// EXEC past a per-lane skip (`exec_joined_at_a_loop_header_is_known_along_its_back_edge`
+/// in `structure.rs`): EXEC joined at the header takes the mask the back
+/// edge brings. Only branches taken wave-wide have that mask tracked
+/// (`structure_wide`); without them the per-lane form, and with it every
+/// program made before the walk, is as it was: this one is refused, with
+/// the walk off and on (its halves are never apart, so there is nothing to
+/// walk), not made with a joined mask no program made before had.
+#[test]
+fn a_loop_s_back_edge_mask_is_tracked_only_with_the_walk() {
+    use super::{Options, emit_with};
+    const LOOP: &[u32] = &[
+        0x7E02_0300, // v_mov_b32 v1, v0
+        0xBE84_0380, // s_mov_b32 s4, 0
+        0x7D8A_0204, // 8: v_cmp_ne_u32 vcc, s4, v1
+        0xBF86_0001, // s_cbranch_vccz -> 20
+        0x7DAA_0281, // v_cmpx_ne_u32 exec, 1, v1
+        0x8104_8104, // 20: s_add_i32 s4, s4, 1
+        0xBF0A_8404, // s_cmp_lt_u32 s4, 4
+        0xBF85_FFFA, // s_cbranch_scc1 -> 8
+        S_ENDPGM,
+    ];
+    for lanes in [32, 64] {
+        for walk in [false, true] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 256,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 2 << 1,
+                    threads: [lanes, 1, 1],
+                }),
+                code: LOOP.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, true, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let bytes = crate::dxbc::build(&[]);
+            let c = crate::dxbc::Container::parse(&bytes).unwrap();
+            let options = Options {
+                wave32_host: true,
+                zero_copy_memory: true,
+                no_wave_walk: !walk,
+                ..Options::default()
+            };
+            let Err(e) = emit_with(&c, &native, &p, &st, &io, &res, options) else {
+                panic!("{lanes} lanes, walk {walk}: made");
+            };
+            assert!(
+                e.to_string()
+                    .contains("a lane-mask join of an untracked mask"),
+                "{lanes} lanes, walk {walk}: {e}"
+            );
+        }
+    }
 }

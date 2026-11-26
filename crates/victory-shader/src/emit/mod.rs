@@ -240,6 +240,8 @@ mod synthetic_tests;
 pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
+#[cfg(test)]
+mod walk_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
@@ -454,6 +456,11 @@ pub struct Options {
     /// memory (module notes, "Wave64 on a 32-lane host"). Implies
     /// [`Self::narrow_waves`]. Off for D3D12.
     pub wave32_host: bool,
+    /// With [`Self::wave32_host`]: a wave64 program whose group is one
+    /// console wave and whose halves cannot meet (an exchange or an LDS read
+    /// in a per-lane branch) is refused, as before the walk ([`widened`]:
+    /// the branches around those places taken by the whole wave).
+    pub no_wave_walk: bool,
     /// The host's title memory is the memory the GPU reads and writes (the native Metal
     /// host: one buffer per pool, no copies): accesses at computed addresses still go through
     /// the page table of "Title memory" to find the host view, but mark nothing, so the
@@ -845,7 +852,34 @@ pub fn emit_with(
         relax: options.relax,
     };
     let guessed = graphics::is_guessed(c);
-    let l = match lower::lower_graphics(&parts(st, res), guessed) {
+    let base = parts(st, res);
+    let lowered = match lower::lower_graphics(&base, guessed) {
+        // A wave64 program whose halves are apart somewhere: the per-lane
+        // branches around those places taken by the whole wave, as the
+        // console takes them.
+        Err(r) => {
+            let (l, rounds) = widened(&base, options, r.apart);
+            // VICTORY_TRACE_WAVE_WALK=1: what each walk took (docs/native-host.md).
+            if rounds > 0 && trace_wave_walk() {
+                let made = match &l {
+                    Ok(_) => "made".to_string(),
+                    Err(Some(e)) => format!("refused ({e})"),
+                    Err(None) => "refused".to_string(),
+                };
+                eprintln!(
+                    "wave walk: {made} after {rounds} lowering(s) with more branches taken wave-wide \
+                     ({} code bytes; first refusal: {})",
+                    native.code.len(),
+                    r.error
+                );
+            }
+            // Refused with the walk too: why its last lowering was, if it
+            // got that far (a scalar branch the halves may take apart, say).
+            l.map_err(|e| e.unwrap_or(r.error))
+        }
+        Ok(l) => Ok(l),
+    };
+    let l = match lowered {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
@@ -854,7 +888,7 @@ pub fn emit_with(
             let res = resource::track_graphics(
                 p, &native.layout, native.stage, Some(&st), guessed && options.zero_copy_memory,
             )?;
-            lower::lower_graphics(&parts(&st, &res), guessed)?
+            lower::lower_graphics(&parts(&st, &res), guessed).map_err(|r| r.error)?
         }
         l => l?,
     };
@@ -887,6 +921,84 @@ pub fn emit_with(
         splits: l.splits,
         table_entries: l.table_entries,
     })
+}
+
+/// `VICTORY_TRACE_WAVE_WALK=1`: each walk ([`widened`]) and how many lowerings it took, on
+/// stderr. Off by default.
+fn trace_wave_walk() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TRACE_WAVE_WALK").as_deref() == Ok("1"))
+}
+
+/// The lowering of `p` (a wave64 compute program whose group is one console
+/// wave, on a 32-lane host: [`Options::wave32_host`]) with the per-lane
+/// branches around the places where its halves have to meet and cannot taken
+/// by the whole wave ([`structure::structure_wide`], [`lower::branches_around`]):
+/// the halves exchange each such decision and go the same way, so they are
+/// together inside. Branches are added while the halves are still apart
+/// somewhere new (`apart`: where the lowering of `base` found them apart,
+/// [`lower::Refused::apart`]); those to the program's end last. `None` if
+/// that does not lower either (with why the last lowering tried did not), or
+/// with [`Options::no_wave_walk`]; with the number of lowerings tried
+/// (`VICTORY_TRACE_WAVE_WALK`).
+fn widened(
+    base: &lower::Parts,
+    options: Options,
+    apart: Vec<usize>,
+) -> (Result<lower::Lowered, Option<ShaderError>>, u32) {
+    let (native, p, st) = (base.native, base.p, base.st);
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return (Err(None), 0);
+    };
+    if !options.wave32_host
+        || options.no_wave_walk
+        || !native.wave64
+        || cs.threads.iter().product::<u32>() != 64
+        || !st.wide.is_empty()
+    {
+        return (Err(None), 0);
+    }
+    let mut wide = structure::Set::default();
+    let mut ending = false;
+    let mut needs = apart;
+    let mut st_now = None;
+    let mut last = None;
+    for round in 0..64 {
+        let at = st_now.as_ref().unwrap_or(st);
+        let mut more = lower::branches_around(p, at, &needs, ending);
+        if more.is_empty() && !ending {
+            ending = true;
+            more = lower::branches_around(p, at, &needs, ending);
+        }
+        if more.is_empty() {
+            return (Err(last), round);
+        }
+        wide.extend(more);
+        let Ok(st) = structure::structure_wide(p, &wide) else {
+            return (Err(last), round + 1);
+        };
+        let Ok(res) = resource::track(p, &native.layout, native.stage, Some(&st)) else {
+            return (Err(last), round + 1);
+        };
+        let parts = lower::Parts {
+            st: &st,
+            res: &res,
+            inputs: base.inputs.clone(),
+            outputs: base.outputs.clone(),
+            prims: base.prims.clone(),
+            ..*base
+        };
+        // (compute: never a guessed graphics program)
+        match lower::lower_graphics(&parts, false) {
+            Ok(l) => return (Ok(l), round + 1),
+            Err(r) => {
+                needs = r.apart;
+                last = Some(r.error);
+            }
+        }
+        st_now = Some(st);
+    }
+    (Err(last), 64)
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
