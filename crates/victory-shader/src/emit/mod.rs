@@ -499,17 +499,151 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    translate_program(&c, &native, options)
+}
+
+/// [`translate_with`] for the program `native` of the container `c`.
+pub fn translate_program(
+    c: &Container,
+    native: &NativeProgram,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    let guessed = graphics::is_guessed(&c);
+    let guessed = graphics::is_guessed(c);
     let computed_buffers = guessed && options.zero_copy_memory;
     let res = resource::track_graphics(
         &p, &native.layout, native.stage, st.as_ref().ok(), computed_buffers,
     )?;
-    let io = io::raise_graphics(&p, &native, guessed)?;
+    let io = io::raise_graphics(&p, native, guessed)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    let made = emit_with(c, native, &p, &st, &io, &res, options);
+    // A whole-wave section that a jump splits (two reductions a branch
+    // chooses between that share their end): once more with each such
+    // section in one block ([`ir::whole_sections`]), where the simulation
+    // follows it. The original's result if that does not translate. Tried
+    // for a program that translates too where it permutes lanes outside the
+    // sections followed (`v_permlanex16_b32` before the jump, as in a
+    // compute program refused for it): such a permute lowered on its own reads the lanes the host has as they
+    // are, where the console's section reads every lane, a lane outside the
+    // saved mask with the reduction's identity. After
+    // darkworldhm/victory-fork-darkworldhm.
+    let permutes = permutes_outside_sections(&p);
+    if made.is_ok() && !permutes {
+        return made;
+    }
+    let limit = instructions(&p).max(MIN_SECTION_COPIES);
+    let (q, rounds, copied) = joined_sections(&p, limit);
+    let Some(q) = q else { return made };
+    let again = (|| {
+        let st = structure::structure(&q)?;
+        let res = resource::track_graphics(
+            &q, &native.layout, native.stage, Some(&st), computed_buffers,
+        )?;
+        let io = io::raise_graphics(&q, native, guessed)?;
+        emit_with(c, native, &q, &st, &io, &res, options)
+    })();
+    let digest = Digest(&c.digest);
+    match (&made, &again) {
+        _ if !join_log() => {}
+        (Ok(_), Ok(_)) => tracing::info!(
+            %digest, stage = ?native.stage, rounds, copied,
+            "a translation that succeeded is replaced: a lane permute outside the whole-wave \
+             sections followed, translated again with the sections a jump splits joined"
+        ),
+        (Err(first), Ok(_)) => tracing::debug!(
+            %digest, stage = ?native.stage, rounds, copied, %first,
+            "translated with the whole-wave sections a jump splits joined"
+        ),
+        (_, Err(e)) => tracing::debug!(
+            %digest, stage = ?native.stage, rounds, copied, error = %e,
+            "joining the whole-wave sections a jump splits did not translate; the first result kept"
+        ),
+    }
+    if again.is_ok() { again } else { made }
+}
+
+/// The most instructions [`ir::whole_sections`] may copy into the arms over
+/// all its rounds: as many as the program has, or this many for a smaller
+/// one. Joining the sections at most doubles a program, however many arms a
+/// join has and however many rounds copy code copied before.
+const MIN_SECTION_COPIES: usize = 256;
+
+/// The rounds [`ir::whole_sections`] gets: a join's code taken into its
+/// arms may end in another section's split start, and a chain of split
+/// sections is joined one link per round from its end (a chain of up to
+/// five blocks; the shared ends seen need one round).
+const SECTION_ROUNDS: usize = 4;
+
+/// The instructions of `p`.
+fn instructions(p: &ir::Program) -> usize {
+    p.blocks.iter().map(|b| b.insts.len()).sum()
+}
+
+/// `p` with the whole-wave sections that jumps split joined
+/// ([`ir::whole_sections`], up to [`SECTION_ROUNDS`] rounds, at most `limit`
+/// instructions copied in all), the rounds that ran and the
+/// instructions copied; `None` if no round changed anything. A round that
+/// would copy past the bound is not made (logged with
+/// `VICTORY_SHADER_JOIN_LOG=1`, [`join_log`]), the rounds before it
+/// kept.
+fn joined_sections(p: &ir::Program, limit: usize) -> (Option<ir::Program>, usize, usize) {
+    let size = instructions(p);
+    let (mut q, mut rounds, mut copied) = (None::<ir::Program>, 0, 0);
+    while rounds < SECTION_ROUNDS {
+        match ir::whole_sections(q.as_ref().unwrap_or(p), limit - copied) {
+            Ok(Some((next, n))) => {
+                q = Some(next);
+                rounds += 1;
+                copied += n;
+            }
+            Ok(None) => break,
+            Err(n) => {
+                if join_log() {
+                    tracing::info!(
+                        size, limit, copied, round = rounds + 1, would_copy = n,
+                        "whole-wave sections a jump splits left split: joining them copies too much"
+                    );
+                }
+                break;
+            }
+        }
+    }
+    (q, rounds, copied)
+}
+
+/// Debugging (`VICTORY_SHADER_JOIN_LOG=1`, off by default): log the
+/// translations [`translate_program`] makes with the whole-wave sections a
+/// jump splits joined (one that replaces a translation that succeeded, a
+/// rescued refusal, a retry that fails) and the rounds the copy bound
+/// skips. Read once.
+fn join_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SHADER_JOIN_LOG").as_deref() == Ok("1"))
+}
+
+/// A container digest in hex, for logs.
+struct Digest<'a>(&'a [u8; 16]);
+
+impl std::fmt::Display for Digest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+/// Whether `p` has a `v_permlane16_b32` or `v_permlanex16_b32` that no
+/// whole-wave section the simulation follows ([`wave::sections`]) holds.
+fn permutes_outside_sections(p: &ir::Program) -> bool {
+    let permute = |inst: &ir::Inst| matches!(inst.name(), "v_permlane16_b32" | "v_permlanex16_b32");
+    p.blocks.iter().enumerate().any(|(b, block)| {
+        if !block.insts.iter().any(permute) {
+            return false;
+        }
+        let sections = wave::sections(p, b);
+        let held = |i: usize| sections.iter().any(|(&start, s)| start < i && i < s.end);
+        block.insts.iter().enumerate().any(|(i, inst)| permute(inst) && !held(i))
+    })
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -784,6 +918,161 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("95")), 64);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
+    }
+
+    /// A branch on s0 picks a wave maximum or minimum, and the two
+    /// reductions share their end: each arm saves EXEC and reduces up to
+    /// the read of lane 32, the join reads lane 0 and restores EXEC (as in
+    /// a compute program refused for `v_permlanex16_b32`). After darkworldhm/victory-fork-darkworldhm's test
+    /// of the paired form. `victory-gpu`'s
+    /// `a_reduction_a_branch_picks_gives_each_lane_its_value_on_metal` runs
+    /// the same program.
+    fn two_reductions() -> crate::ir::Program {
+        let arm = |init: u32, op: u32| {
+            let mut w = vec![
+                0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+                0x7E04_02FF,
+                init, // v_mov_b32 v2, init
+                0xD501_0002,
+                0x0032_0902, // v_cndmask_b32 v2, v2, v4, s[12:13]
+            ];
+            for dpp in [0xDE54_C102, 0x9360_1202, 0x0009_2402] {
+                w.extend([op << 25 | 0x0004_04E9, dpp]); // v_<op>_f32 v2, v2, v2 dpp8
+            }
+            w.extend([
+                op << 25 | 0x0004_04FA,
+                0xFF09_4002, // v_<op>_f32 v2, v2, v2 row_mirror bound_ctrl:1
+                0xD778_0003,
+                0x0201_0102,            // v_permlanex16_b32 v3, v2, 0, 0
+                op << 25 | 0x0004_0503, // v_<op>_f32 v2, v3, v2
+                0xD760_000E,
+                0x0001_4102,            // v_readlane_b32 s14, v2, 32
+                op << 25 | 0x0004_040E, // v_<op>_f32 v2, s14, v2
+            ]);
+            w
+        };
+        let mut words = vec![
+            0x7E08_0D00, // v_cvt_f32_u32 v4, v0
+            0x0608_08F2, // v_add_f32 v4, 1.0, v4
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0014, // s_cbranch_scc1 to the minimum
+        ];
+        words.extend(arm(0xFF80_0000, 0x10)); // the maximum from -inf
+        words.push(0xBF82_0013); // s_branch to the join
+        words.extend(arm(0x7F80_0000, 0x0F)); // the minimum from +inf
+        words.extend([
+            0xD760_000E,
+            0x0001_0102, // v_readlane_b32 s14, v2, 0
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x7E00_020E, // v_mov_b32 v0, s14
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::ir::build(&code, true, 8).expect("ir::build")
+    }
+
+    /// Neither block of [`two_reductions`] holds a whole section; with the
+    /// join's code in each arm both do.
+    #[test]
+    fn two_reductions_that_share_their_end_become_two_sections() {
+        let p = two_reductions();
+        let sections = |p: &crate::ir::Program| {
+            (0..p.blocks.len()).map(|b| super::wave::sections(p, b).len()).sum::<usize>()
+        };
+        assert_eq!(sections(&p), 0);
+        assert!(super::permutes_outside_sections(&p));
+        let (q, copied) = crate::ir::whole_sections(&p, usize::MAX)
+            .expect("within the bound")
+            .expect("sections to join");
+        assert_eq!(copied, 2 * 5, "the join's five instructions, once in each arm");
+        assert_eq!(sections(&q), 2);
+        assert!(!super::permutes_outside_sections(&q));
+        assert!(
+            matches!(crate::ir::whole_sections(&q, usize::MAX), Ok(None)),
+            "nothing left to join"
+        );
+        crate::structure::structure(&q).expect("the joined program structures");
+    }
+
+    /// The sections are joined only while the copies stay within the bound:
+    /// a round that would copy more is not made, and the program is left
+    /// as it was (or as the rounds before left it).
+    #[test]
+    fn sections_are_not_joined_past_the_copy_bound() {
+        let p = two_reductions();
+        assert_eq!(
+            crate::ir::whole_sections(&p, 9).err(),
+            Some(10),
+            "two copies of the five-instruction join"
+        );
+        let (q, rounds, copied) = super::joined_sections(&p, 9);
+        assert!(q.is_none() && rounds == 0 && copied == 0);
+        let (q, rounds, copied) = super::joined_sections(&p, 10);
+        assert!(q.is_some(), "joined at the bound");
+        assert_eq!((rounds, copied), (1, 10));
+    }
+
+    /// A chain of sections: block A starts one and jumps to B, B restores
+    /// it and starts another and jumps to C, C restores that and stores.
+    fn chained_sections() -> crate::ir::Program {
+        let words = [
+            0xBE8C_25C1, // A: s_or_saveexec_b64 s[12:13], -1
+            0xBF82_0000, // s_branch to B
+            0xBEFE_040C, // B: s_mov_b64 exec, s[12:13]
+            0xBE8E_25C1, // s_or_saveexec_b64 s[14:15], -1
+            0xBF82_0000, // s_branch to C
+            0xBEFE_040E, // C: s_mov_b64 exec, s[14:15]
+            0x7E00_020E, // v_mov_b32 v0, s14
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect();
+        crate::ir::build(&code, true, 8).expect("ir::build")
+    }
+
+    /// The `buffer_store_dword`s reachable from the entry of `p`.
+    fn reachable_stores(p: &crate::ir::Program) -> usize {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut work = vec![0];
+        let mut stores = 0;
+        while let Some(b) = work.pop() {
+            if std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            let block = &p.blocks[b];
+            stores += block.insts.iter().filter(|i| i.name() == "buffer_store_dword").count();
+            work.extend(block.exit.successors());
+        }
+        stores
+    }
+
+    /// A join whose code an arm takes is not emptied in the same round by
+    /// taking its own join's code: the chain's store stays reachable, and
+    /// both sections end up in the first block.
+    #[test]
+    fn a_chain_of_split_sections_keeps_its_store() {
+        let p = chained_sections();
+        assert_eq!(p.blocks.len(), 3);
+        assert_eq!(reachable_stores(&p), 1);
+        let sections = |p: &crate::ir::Program| {
+            (0..p.blocks.len()).map(|b| super::wave::sections(p, b).len()).sum::<usize>()
+        };
+        assert_eq!(sections(&p), 0);
+        let mut q = p.clone();
+        while let Ok(Some((next, _))) = crate::ir::whole_sections(&q, usize::MAX) {
+            assert_eq!(reachable_stores(&next), 1, "a round lost the store");
+            q = next;
+        }
+        let (j, rounds, copied) = super::joined_sections(&p, usize::MAX);
+        let j = j.expect("sections to join");
+        assert_eq!(reachable_stores(&j), 1);
+        assert_eq!(super::wave::sections(&j, 0).len(), 2, "both sections in the entry block");
+        assert_eq!(rounds, 2, "one link of the chain per round, from its end");
+        assert_eq!(copied, 4 + 6, "C's four into B, then B's restore, start and those four into A");
+        crate::structure::structure(&j).expect("the joined program structures");
     }
 
     #[test]
