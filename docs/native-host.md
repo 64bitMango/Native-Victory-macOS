@@ -503,3 +503,38 @@ The title's texture formats are DXGI numbers (`resource::pc_format` only renames
 | 54 | R16_FLOAT | 512x512 | R16Float |
 
 Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. B5G5R5A1_UNORM (86, a 1024x4096 render target) and B4G4R4A4_UNORM (115, a 2560x1440 render target) map to Metal's packed formats. A GPU test (`victory-metal` `packed_16_bit_channel_order`) pins their bit order. `BGR5A1Unorm` matches DXGI: blue in bits 0-4, green in 5-9, red in 10-14, alpha in bit 15. `ABGR4Unorm` holds alpha in bits 0-3, blue in 4-7, green in 8-11 and red in 12-15, where DXGI has blue, green, red, alpha from the low nibble up. So title bytes of format 115 are rotated left by 4 bits as they are uploaded (`textures::to_host`). The host's own render writes and samples agree with each other, and host textures never go back to title memory, so only uploads need the conversion. Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.
+
+## Mesh outputs on Metal
+
+These findings come from the D3D12 host under Wine, where D3DMetal runs Apple's Metal Shader Converter, and from the standalone converter on synthetic meshes (docs/metal-backend.md, "Shader corpus"). The native host has no mesh pipeline yet, so both translation options below are off there until one lands (`VICTORY_MESH_STORES_LAST=1` and `VICTORY_MESH_PACK=1` turn them on; both are read once, and only `0` and `1` count). Under Wine they are on (`0` turns each off).
+
+### Output stores (`Options::mesh_stores_last`)
+
+The converter builds a mesh output row's vector at the store of the row's first channel. When a later channel's value is made after that store (a 16-bit half widened, a bitcast), the AIR uses it before it is defined. Apple's GPU compiler then crashes in register allocation on every pipeline whose pixel shader reads that row, and other pipelines compiling at the same time fail with it (`XPC_ERROR_CONNECTION_INTERRUPTED`). With this option each export's output stores come after all the values they store. Over the 302 mesh pipelines of one run under Wine, 30 crashed before and none with it.
+
+### How Metal counts a mesh's output size
+
+Metal refuses a mesh pipeline whose output it counts above 32768 bytes. It counts the maximum vertex count times the vertex struct the converter makes of the output signature, plus the primitive outputs counted the same way (`container::metal_record`, `metal_mesh_bytes`). Metal's own messages for mesh pipelines of chosen output structs fixed this rule (`metal_records_are_the_sizes_metal_reports`), and the synthetic meshes of the `emit` tests measure exactly as counted with the standalone converter.
+
+- The struct starts with the clip and cull distances as a float array of 4 bytes each.
+- Then comes the position, wherever its element is in the signature.
+- Then there is one field per other element, in element order. The distances are counted a second time here.
+- Each field has as many 32-bit components as its element, and is aligned to its own size: 4, 8, 12 or 16 bytes. A 3-vector packs at a multiple of 12, not 16. There is no padding at the end.
+- Every field counts, whether the pixel shader reads it or not. How the signature packs elements into rows does not matter.
+
+### Keeping meshes within the limit (`Options::mesh_pack_outputs`)
+
+A mesh over the limit gets its vertex outputs reordered for the least padding (`container::metal_packed_order`): the system values first, then the order of the rest with the smallest record, found exactly by a search over how many elements of each size are left and the offset modulo 48 (placing the widest element that needs no padding first misses some layouts that fit). Element order is not what links the stages (semantics do), so pixel shaders stay as they are. Meshes within the limit translate as before.
+
+If a mesh is still over the limit when packed, it also leaves out the clip and cull distances that it sets to +0.0 at every vertex (`container::without_idle_distances`). Those clip nothing. They are taken only from the end of the console's distance vectors, so that the others keep their places.
+
+### What is left, and the API kept for a native mesh pipeline
+
+Under Wine, packing fixed all 13 mesh and pixel pairs that failed in the 25 November runs. In longer runs, about 800 of some 12,000 mesh and pixel passes were over the limit. Packing fixed about three quarters of them. Leaving out the outputs each pixel shader does not read fixed most of the rest. A few dozen stay over the limit, because their pixel shader reads more than fits.
+
+Leaving outputs out needs both stages of a pipeline. The D3D12 host's per-pipeline version of it has been removed. The translator's side stays, for a native mesh pipeline to use:
+
+- `emit::pixel_reads` and `pixel_reads_channels` give what a translated pixel shader reads, as a `Kept`.
+- `emit::translate_keeping` with that `Kept` makes a mesh without the other outputs. With channels, it narrows the kept outputs to the channels read, and a pixel shader's inputs to match.
+- `emit::stages_link` checks that the two narrowed stages agree. Metal links a field by its semantic and takes it as wide as each stage declares it, so both stages must be narrowed together.
+- `emit::mesh_over_metal_limit` and `mesh_outputs_unread` decide when any of this is needed.

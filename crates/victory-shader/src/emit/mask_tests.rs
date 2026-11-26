@@ -54,23 +54,8 @@ fn lowered(body: &[u32], lanes: u32, wave32_host: bool) -> Result<Lowered, crate
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
     lower::lower(&Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: vec![],
-        outputs: vec![],
-        prims: vec![],
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
         wave32_host,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        view_marks: false,
+        ..Parts::new(&native, &p, &st, &io, &res)
     })
 }
 

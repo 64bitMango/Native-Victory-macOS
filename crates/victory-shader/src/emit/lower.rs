@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     pub view_marks: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Mesh: per clip or cull distance output (its element), the channels
+    /// every store gives +0.0: distances that clip and cull nothing.
+    pub idle_distances: Vec<(usize, u8)>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -85,6 +88,10 @@ pub(crate) struct Lowered {
     /// Whether the DXIL holds the group-shared array host waves exchange in.
     #[cfg(test)]
     pub exchanges: bool,
+    /// Runs of mesh vertex output stores with no other instruction between
+    /// them ([`Options::mesh_stores_last`](super::Options)).
+    #[cfg(test)]
+    pub vertex_store_runs: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -96,6 +103,10 @@ pub(crate) struct Parts<'a> {
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     pub prims: Vec<SigElement>,
+    /// Mesh: the vertex outputs left out of `outputs`
+    /// ([`translate_keeping`](super::translate_keeping)); exports to them
+    /// store nothing, but their rows and 16-bit slots stay taken.
+    pub dropped: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
@@ -118,6 +129,41 @@ pub(crate) struct Parts<'a> {
     pub copy_params: [u8; 32],
 }
 
+#[cfg(any(test, all(windows, feature = "host")))]
+impl<'a> Parts<'a> {
+    /// Parts with no signatures and every option off, for tests and probes
+    /// to start from (`Parts { outputs, ..Parts::new(..) }`), so that a new
+    /// field does not have to be added to each of them.
+    pub fn new(
+        native: &'a NativeProgram,
+        p: &'a Program,
+        st: &'a Structured,
+        io: &'a Io,
+        res: &'a Resources,
+    ) -> Self {
+        Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            dropped: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            wave32_host: false,
+            zero_copy_memory: false,
+            rect_list: false,
+            copy_params: [0; 32],
+        }
+    }
+}
+
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
@@ -126,17 +172,25 @@ enum Stop {
 
 #[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_graphics(parts, false)
+    lower_graphics(parts, false, false)
 }
 
-pub(crate) fn lower_graphics(parts: &Parts, guessed: bool) -> Result<Lowered, ShaderError> {
+/// [`lower`], for a guessed graphics pipeline or not, with the mesh store
+/// order [`super::Options::mesh_stores_last`] chooses.
+pub(crate) fn lower_graphics(
+    parts: &Parts,
+    guessed: bool,
+    mesh_stores_last: bool,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     // Compute programs hold masks the structurisation cannot see into
     // (built from scalars, shifted) only with the console's lanes: asked
     // for when the first try finds one used.
     let mut console = false;
     loop {
-        match Lower::new(parts, &bad, console, guessed).run() {
+        let mut l = Lower::new(parts, &bad, console, guessed);
+        l.mesh_stores_last = mesh_stores_last;
+        match l.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -322,6 +376,9 @@ struct Lower<'a> {
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
+    /// Mesh: an export's output stores all come after the values they
+    /// store ([`Options::mesh_stores_last`](super::Options)).
+    mesh_stores_last: bool,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -817,6 +874,7 @@ impl<'a> Lower<'a> {
             no_barrier,
             split_barriers,
             half_outputs: half_outputs(&x.native.io),
+            mesh_stores_last: false,
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -1536,6 +1594,19 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        let idle_distances = match self.s.mesh {
+            Some(_) => (0..self.s.outputs.len())
+                .filter(|&id| matches!(self.s.outputs[id].kind, 6 | 7))
+                .map(|id| {
+                    let (stored, live) = self
+                        .s
+                        .m
+                        .stored_channels("dx.op.storeVertexOutput", id as u32);
+                    (id, stored & !live)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let splits = self
             .split_inputs
             .iter()
@@ -1590,9 +1661,12 @@ impl<'a> Lower<'a> {
             barriers: self.s.m.written_calls("dx.op.barrier"),
             #[cfg(test)]
             exchanges: self.s.xchg_used(),
+            #[cfg(test)]
+            vertex_store_runs: self.s.m.written_call_runs("dx.op.storeVertexOutput"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            idle_distances,
         })
     }
 
@@ -11792,6 +11866,13 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
+        // The console packs the 16-bit elements it has, those left out
+        // included: placed among the kept ones alone, a kept element would
+        // take the slots of one left out before it.
+        let console: Vec<SigElement> = match halves {
+            Some((_, true)) => outputs.iter().chain(&self.x.dropped).cloned().collect(),
+            _ => Vec::new(),
+        };
         if let Some((row, pack2)) = halves {
             for ch in 0..4u8 {
                 let Some(value) = e.values[usize::from(ch)] else {
@@ -11800,7 +11881,7 @@ impl<'a> Lower<'a> {
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
                     let src = if pack2 {
-                        packed_half(outputs, row, h)
+                        packed_half(&console, row, h)
                     } else {
                         (!high).then_some((row, ch))
                     };
@@ -11933,6 +12014,15 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // Mesh, with `mesh_stores_last`: every value first, then the stores
+        // in a run. Metal shader converter builds a row's vector where the
+        // row's first channel is stored, from the values of all its
+        // channels; a value made after that store (a 16-bit half widened, a
+        // bitcast) is used before it is defined, and Apple's GPU compiler
+        // crashes in register allocation when the pixel shader reads that
+        // row.
+        let defer = mesh && self.mesh_stores_last;
+        let mut deferred = Vec::new();
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -12015,27 +12105,46 @@ impl<'a> Lower<'a> {
                 }
                 _ => x,
             };
-            let mut args = vec![
-                self.s.m.i32(id as u32),
-                self.s.m.i32(0),
-                self.s.m.i8(col),
-                x,
-            ];
-            if mesh {
-                args.push(self.mesh_thread());
+            if defer {
+                deferred.push((id, col, suffix, x));
+            } else {
+                self.store_output(name, opcode, mesh, (id, col, suffix, x));
             }
-            let void = self.s.t.void;
-            self.s.op(
-                self.cur,
-                &format!("{name}{suffix}"),
-                Attr::NoUnwind,
-                void,
-                opcode,
-                &args,
-            );
+        }
+        for store in deferred {
+            self.store_output(name, opcode, mesh, store);
         }
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    /// One output store of [`Lower::export`]: output element `id`'s channel
+    /// `col` takes `x` (an `.f32` or `.i32` value, as `suffix` says).
+    fn store_output(
+        &mut self,
+        name: &str,
+        opcode: u32,
+        mesh: bool,
+        (id, col, suffix, x): (usize, u8, &str, V),
+    ) {
+        let mut args = vec![
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            x,
+        ];
+        if mesh {
+            args.push(self.mesh_thread());
+        }
+        let void = self.s.t.void;
+        self.s.op(
+            self.cur,
+            &format!("{name}{suffix}"),
+            Attr::NoUnwind,
+            void,
+            opcode,
+            &args,
+        );
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
@@ -12075,12 +12184,14 @@ impl<'a> Lower<'a> {
                 .iter()
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
+        // The rows of outputs left out count: the unnamed one may be one.
         let free: std::collections::BTreeSet<u32> = self
             .s
             .outputs
             .iter()
             .filter(|o| o.kind == 0)
             .filter_map(|o| o.row)
+            .chain(self.x.dropped.iter().filter_map(|o| o.row))
             .filter(|&r| !named(r))
             .collect();
         match free.into_iter().collect::<Vec<_>>()[..] {
@@ -12928,26 +13039,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-            atomic_locks: false,
-            bias_as_gradients: false,
-            narrow_waves: false,
-            wave32_host: false,
-            zero_copy_memory: false,
-            rect_list: false,
-            copy_params: [0; 32],
-            view_marks: false,
-        })
-        .map(|_| ())
+        lower(&Parts::new(&native, &p, &st, &io, &res)).map(|_| ())
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -12986,25 +13078,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-            atomic_locks: false,
-            bias_as_gradients: false,
-            narrow_waves: false,
-            wave32_host: false,
-            zero_copy_memory: false,
-            rect_list: false,
-            copy_params: [0; 32],
-            view_marks: false,
-        })
+        lower(&Parts::new(&native, &p, &st, &io, &res))
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
@@ -13189,26 +13263,7 @@ mod tests {
 
         let io = io::raise(&p, &native).unwrap();
 
-        let emitted = lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-            atomic_locks: false,
-            bias_as_gradients: false,
-            narrow_waves: false,
-            wave32_host: false,
-            zero_copy_memory: false,
-            rect_list: false,
-            copy_params: [0; 32],
-            view_marks: false,
-        })
-        .unwrap();
+        let emitted = lower(&Parts::new(&native, &p, &st, &io, &res)).unwrap();
 
         let container = crate::Container::parse(&emitted.dxil).unwrap();
 
@@ -14027,23 +14082,9 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-            atomic_locks: false,
-            bias_as_gradients: false,
             narrow_waves,
             wave32_host,
-            zero_copy_memory: false,
-            rect_list: false,
-            copy_params: [0; 32],
-            view_marks: false,
+            ..Parts::new(&native, &p, &st, &io, &res)
         })
         .expect("lower")
     }

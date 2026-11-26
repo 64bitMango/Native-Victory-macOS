@@ -282,26 +282,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
     let st = structure::structure(&p).map_err(e)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).map_err(e)?;
     let io = io::raise(&p, &native).map_err(e)?;
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        view_marks: false,
-    })
-    .map_err(e)?;
+    let lowered = lower::lower(&lower::Parts::new(&native, &p, &st, &io, &res)).map_err(e)?;
     Ok(HostShader {
         splits: Vec::new(),
         table_entries: lowered.table_entries,

@@ -178,26 +178,7 @@ fn program() -> HostShader {
     let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
     assert_eq!(memory, 11, "every access through the pointer is title memory");
     let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        view_marks: false,
-    })
-    .expect("lower");
+    let l = lower::lower(&lower::Parts::new(&native, &p, &st, &io, &res)).expect("lower");
     assert!(l.memory && l.memory_writes && l.view_addresses);
     assert!(l.root_uavs.is_empty(), "the root UAV is read as title memory");
     let shader = HostShader {
@@ -416,26 +397,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        view_marks: false,
-    })
-    .expect("lower");
+    let l = lower::lower(&lower::Parts::new(&native, &p, &st, &io, &res)).expect("lower");
     assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
     let marks: Vec<(u32, u32)> = l
         .user_data
@@ -568,23 +530,8 @@ fn writes_through_views_mark_their_pages() {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
         view_marks: true,
+        ..lower::Parts::new(&native, &p, &st, &io, &res)
     })
     .expect("lower");
     assert!(l.view_marks && !l.memory, "marks without the page table");
@@ -693,23 +640,8 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
         let io = io::raise(&p, &native).expect("io::raise");
         lower::lower(&lower::Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            prims: Vec::new(),
-            mesh_stride: 0,
             view_marks: true,
-            atomic_locks: false,
-            bias_as_gradients: false,
-            narrow_waves: false,
-            wave32_host: false,
-            zero_copy_memory: false,
-            rect_list: false,
-            copy_params: [0; 32],
+            ..lower::Parts::new(&native, &p, &st, &io, &res)
         })
         .expect("lower")
     };

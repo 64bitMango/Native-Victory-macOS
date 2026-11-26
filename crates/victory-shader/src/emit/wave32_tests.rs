@@ -121,23 +121,8 @@ fn lowered(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
     let l = lower::lower(&Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: vec![],
-        outputs: vec![],
-        prims: vec![],
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
         wave32_host,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        view_marks: false,
+        ..Parts::new(&native, &p, &st, &io, &res)
     })?;
     // VICTORY_DUMP_DXIL=<dir>: keep the containers, to run Apple's converter on.
     if let (Some(dir), true) = (std::env::var_os("VICTORY_DUMP_DXIL"), wave32_host) {

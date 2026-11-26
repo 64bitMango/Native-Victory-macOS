@@ -738,25 +738,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
     let st = crate::structure::structure(&p)?;
     let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = crate::io::raise(&p, &native)?;
-    let lowered = super::lower::lower(&super::lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        view_marks: false,
-    })?;
+    let lowered = super::lower::lower(&super::lower::Parts::new(&native, &p, &st, &io, &res))?;
     Ok(HostShader {
         splits: Vec::new(),
         table_entries: lowered.table_entries,

@@ -154,11 +154,8 @@ pub(super) fn computed_subword_test_shader(op: u32, bounds: u32) -> super::HostS
     assert!(res.descriptors.iter().any(|d| matches!(d.source, resource::Source::BuiltMemory { .. })));
     let io = io::raise(&p, &native).unwrap();
     let l = lower::lower(&Parts {
-        native: &native, p: &p, st: &st, io: &io, res: &res,
-        inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0,
-        atomic_locks: false, bias_as_gradients: false, narrow_waves: false,
-        wave32_host: false, zero_copy_memory: true, view_marks: false,
-        rect_list: false, copy_params: [0; 32],
+        zero_copy_memory: true,
+        ..Parts::new(&native, &p, &st, &io, &res)
     }).unwrap();
     super::HostShader {
         stage: HwStage::Cs, dxil: l.dxil, splits: l.splits, table_entries: l.table_entries,
@@ -231,23 +228,10 @@ fn lower_ps(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
     lower::lower(&Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
         inputs,
         outputs: vec![sig_el("SV_Target", 0, 16, 9, 0, Some(0), 4)],
-        prims: vec![],
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
         wave32_host,
-        zero_copy_memory: false,
-        view_marks: false,
-        rect_list: false,
-        copy_params: [0; 32],
+        ..Parts::new(&native, &p, &st, &io, &res)
     })
 }
 
@@ -274,23 +258,9 @@ fn lower_vs(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
     lower::lower(&Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: vec![],
         outputs: vec![sig_el("SV_Position", 0, 3, 9, 0, Some(0), 4)],
-        prims: vec![],
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        view_marks: false,
         rect_list,
-        copy_params: [0; 32],
+        ..Parts::new(&native, &p, &st, &io, &res)
     })
 }
 

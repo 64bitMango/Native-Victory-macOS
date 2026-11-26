@@ -188,26 +188,7 @@ fn build(
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        view_marks: false,
-    })
-    .expect("lower");
+    let lowered = lower::lower(&lower::Parts::new(&native, &p, &st, &io, &res)).expect("lower");
     let shader = HostShader {
         splits: Vec::new(),
         table_entries: lowered.table_entries,
