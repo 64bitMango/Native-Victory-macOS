@@ -59,27 +59,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        relax: Default::default(),
-        view_marks: false,
-    })
-    .expect("lower");
+    let lowered = lower::lower(&lower::Parts::new(&native, &p, &st, &io, &res)).expect("lower");
     // One access with each lane's own heap index, no wave operation.
     assert_eq!(lowered.nonuniform_handles, 1);
     assert!(!lowered.wave_ops);

@@ -266,8 +266,28 @@ Failures:
   This is the largest open item of the shader path.
 - Mesh pipeline, 28 shaders: Metal rejects "Total mesh size exceeds the maximum mesh size allowed (32768)"
   at 34 816 to 38 400 bytes (vertex plus primitive output memory of the shader's declared maxima).
-  Needs the translator to declare tighter output maxima, or a split.
+  Metal counts the maximum vertex count times the struct the converter makes of the output signature
+  (a clip-distance array, the position, then one field per element in element order, each aligned to its
+  own size), every field whether read or not, plus the primitive outputs alike (`container::metal_record`,
+  `metal_mesh_bytes`). The translator can keep meshes within it (`Options::mesh_pack_outputs`, off on the
+  native host until it has mesh pipelines, `VICTORY_MESH_PACK=1` turns it on): a mesh over the limit gets
+  its outputs ordered for the least padding and, if still over, loses the clip distances it gives +0.0 at
+  every vertex. Leaving out the outputs a pixel shader does not read, or narrowing them to the channels it
+  reads (`emit::translate_keeping`, `pixel_reads_channels`, `stages_link`), needs both stages of a
+  pipeline, so it waits for a native mesh pipeline. See docs/native-host.md, "Mesh outputs on Metal".
+  Checked with this harness on synthetic meshes (`emit` tests `param_mesh`, `distance_elements`): Metal
+  reported 44 544 and 47 104 bytes for the plain ones, exactly as counted, and built the packed, kept,
+  narrowed and distance-free ones.
 - Nothing else failed: no `UnsupportedInstruction`, `CompilationError`, root-signature or link errors.
+- Not in this harness (it builds mesh pipelines without a pixel stage): the converter builds a mesh output
+  row's vector where the row's first channel is stored. When a later channel's value is made after that
+  store (a 16-bit half widened, a bitcast) the AIR uses it before it is defined, and Apple's GPU compiler
+  crashes in register allocation on every mesh pipeline whose pixel shader reads that row
+  (`XPC_ERROR_CONNECTION_INTERRUPTED`; other pipelines compiling at the same time fail with it). The
+  translator can store each export's outputs after all their values (`Options::mesh_stores_last`): on
+  under Wine, off on the native host until it has mesh pipelines (`VICTORY_MESH_STORES_LAST=0` or `1`
+  overrides). Under Wine, with D3DMetal's
+  converter over the 302 mesh pipelines of a run: 30 crashed before, none with it.
 
 How pipelines were built (a harness, not the real render path, so the pixel and vertex numbers say "Metal
 accepts the converted function", not "the right pipeline"): compute: `MTLComputePipelineState`; vertex:

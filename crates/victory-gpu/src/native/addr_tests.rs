@@ -507,6 +507,7 @@ fn a_reduction_a_branch_picks_gives_each_lane_its_value_on_metal() {
         }
     }
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
 
 /// Every lane: `dst[tid] = v_cvt_flr_i32_f32(src[tid])`. `s[0:1]` is `src`, `s[2:3]` is `dst`.
 const FLOORS: &[u32] = &[

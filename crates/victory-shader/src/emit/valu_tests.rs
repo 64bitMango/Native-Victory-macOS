@@ -130,26 +130,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     let st = st?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        relax: Default::default(),
-        view_marks: false,
-    })?;
+    let lowered = lower::lower(&lower::Parts::new(&native, &p, &st, &io, &res))?;
 
     let shader = HostShader {
         splits: Vec::new(),
@@ -1300,24 +1281,9 @@ fn lower_cs32_with(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
         atomic_locks,
         bias_as_gradients: super::host::under_wine(),
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        relax: Default::default(),
-        view_marks: false,
+        ..lower::Parts::new(&native, &p, &st, &io, &res)
     })
     .expect("lower");
     let shader = HostShader {

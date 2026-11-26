@@ -582,27 +582,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         "the BVH's base traced to the root SRV, or read from the operand"
     );
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves: false,
-        wave32_host: false,
-        zero_copy_memory: false,
-        rect_list: false,
-        copy_params: [0; 32],
-        relax: Default::default(),
-        view_marks: false,
-    })
-    .expect("lower");
+    let lowered = lower::lower(&lower::Parts::new(&native, &p, &st, &io, &res)).expect("lower");
     let shader = HostShader {
         splits: Vec::new(),
         table_entries: lowered.table_entries,

@@ -137,6 +137,35 @@ pub(crate) fn relax() -> victory_shader::emit::Relax {
     })
 }
 
+/// Whether mesh shaders store their outputs after computing them all:
+/// under Wine, where D3DMetal's Metal Shader Converter builds an output row
+/// from values made after the row's first store, and Apple's GPU compiler
+/// then crashes on the pipeline (`emit::Options::mesh_stores_last`).
+/// `VICTORY_MESH_STORES_LAST=0` or `1` overrides.
+pub(crate) fn mesh_stores_last() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_MESH_STORES_LAST").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
+/// Whether mesh shaders whose outputs Metal would count over its limit
+/// order them for the least padding: under Wine, where D3DMetal fails such
+/// pipelines ("Total mesh size (N) exceeds the maximum mesh size allowed
+/// (32768)") and draws nothing with them (`emit::Options::mesh_pack_outputs`).
+/// Other meshes translate as without it. `VICTORY_MESH_PACK=0` or `1`
+/// overrides.
+pub(crate) fn mesh_pack_outputs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_MESH_PACK").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -156,26 +185,38 @@ pub(crate) fn under_wine() -> bool {
     false
 }
 
-/// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients, narrow waves): their own cache entries, one per
-/// combination.
-fn options_build(locks: bool, bias: bool, narrow: bool) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 8] = [const { OnceLock::new() }; 8];
-    let n = usize::from(locks) | usize::from(bias) << 1 | usize::from(narrow) << 2;
-    BUILDS[n].get_or_init(|| {
-        let mut h = blake3::Hasher::new();
-        h.update(build());
-        if locks {
-            h.update(b"atomic locks");
-        }
-        if bias {
-            h.update(b"bias as gradients");
-        }
-        if narrow {
-            h.update(b"narrow waves");
-        }
-        *h.finalize().as_bytes()
-    })
+/// The build part of the cache key of translations made with `o`: `base`
+/// itself without host workarounds, else `base` and the workarounds on
+/// (atomic locks, bias as gradients, narrow waves, mesh stores last, mesh
+/// outputs packed), so each combination has entries of its own.
+fn options_key(base: &[u8; 32], o: &victory_shader::emit::Options) -> [u8; 32] {
+    let workarounds = [
+        (o.atomic_locks, "atomic locks"),
+        (o.bias_as_gradients, "bias as gradients"),
+        (o.narrow_waves, "narrow waves"),
+        (o.mesh_stores_last, "mesh stores last"),
+        (o.mesh_pack_outputs, "mesh outputs packed"),
+    ];
+    if !workarounds.iter().any(|w| w.0) {
+        return *base;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(base);
+    for (_, name) in workarounds.iter().filter(|w| w.0) {
+        h.update(name.as_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
+/// [`options_key`] of [`build`], made once per combination.
+fn options_build(o: &victory_shader::emit::Options) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
+    let n = usize::from(o.atomic_locks)
+        | usize::from(o.bias_as_gradients) << 1
+        | usize::from(o.narrow_waves) << 2
+        | usize::from(o.mesh_stores_last) << 3
+        | usize::from(o.mesh_pack_outputs) << 4;
+    BUILDS[n].get_or_init(|| options_key(build(), o))
 }
 
 /// `build` for translations with console float rules relaxed.
@@ -208,18 +249,12 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         copy_params: [0; 32],
         extra_params: 0,
         relax: relax(),
+        mesh_stores_last: mesh_stores_last(),
+        mesh_pack_outputs: mesh_pack_outputs(),
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks || options.bias_as_gradients || options.narrow_waves {
-        options_build(
-            options.atomic_locks,
-            options.bias_as_gradients,
-            options.narrow_waves,
-        )
-    } else {
-        build()
-    };
+    let build = options_build(&options);
     // Relaxed float rules: entries of their own, by the kinds relaxed.
     let relaxed;
     let build = if options.relax != victory_shader::emit::Relax::default() {
@@ -670,5 +705,43 @@ mod tests {
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
         assert_eq!(decode(&encode(&refusal)), Some(refusal));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);
+    }
+
+    /// Each host workaround, the mesh ones among them, gives translations
+    /// cache entries of their own, and so does each combination: a
+    /// translation made without one is never served where it is on.
+    #[test]
+    fn host_workarounds_change_the_cache_key() {
+        use victory_shader::emit::Options;
+        let base = [7; 32];
+        let plain = Options::default();
+        assert_eq!(options_key(&base, &plain), base);
+        let stores_last = Options {
+            mesh_stores_last: true,
+            ..plain
+        };
+        let packed = Options {
+            mesh_pack_outputs: true,
+            ..plain
+        };
+        let both = Options {
+            mesh_stores_last: true,
+            mesh_pack_outputs: true,
+            ..plain
+        };
+        let locks = Options {
+            atomic_locks: true,
+            ..plain
+        };
+        let keys = [plain, stores_last, packed, both, locks].map(|o| options_key(&base, &o));
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // The key follows the translator's build too.
+        assert_ne!(options_key(&[8; 32], &packed), keys[2]);
+        // And the one each host uses is that of its build.
+        assert_eq!(*options_build(&packed), options_key(build(), &packed));
     }
 }

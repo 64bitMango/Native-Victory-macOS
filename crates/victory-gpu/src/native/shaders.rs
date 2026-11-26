@@ -17,6 +17,7 @@ use super::state::{self, Graphics};
 use super::title::{Pipe, Title};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use victory_backend::resources::*;
 use victory_shader::emit::{HostShader, Options};
 
@@ -32,6 +33,8 @@ pub fn options() -> Options {
         relax: relax(),
         no_wave_walk: *NO_WALK
             .get_or_init(|| std::env::var("VICTORY_WAVE_WALK").as_deref() == Ok("0")),
+        mesh_stores_last: mesh_stores_last(),
+        mesh_pack_outputs: mesh_pack_outputs(),
         ..Options::default()
     }
 }
@@ -47,6 +50,34 @@ fn relax() -> victory_shader::emit::Relax {
             tracing::info!(?relax, "console float rules left to the host's (VICTORY_RELAX_FLOAT)");
         }
         relax
+    })
+}
+
+/// Whether mesh shaders store their outputs after computing them all
+/// (`Options::mesh_stores_last`): Apple's converter builds a mesh output row from values made
+/// after its first store, and Apple's GPU compiler then crashes on the pipeline. Off until the
+/// native host has mesh pipelines to check it with; `VICTORY_MESH_STORES_LAST=1` turns it on
+/// (`0` off), read once.
+fn mesh_stores_last() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_MESH_STORES_LAST").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        // Off by default: no native mesh pipeline yet.
+        _ => false,
+    })
+}
+
+/// Whether mesh shaders whose outputs Metal would count over its 32 KiB limit order them for
+/// the least padding (`Options::mesh_pack_outputs`). Off until the native host has mesh
+/// pipelines to check it with; `VICTORY_MESH_PACK=1` turns it on (`0` off), read once.
+fn mesh_pack_outputs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_MESH_PACK").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        // Off by default: no native mesh pipeline yet.
+        _ => false,
     })
 }
 
