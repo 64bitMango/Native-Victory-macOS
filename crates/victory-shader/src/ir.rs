@@ -310,8 +310,8 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
 /// restores the mask, takes that block's code and exit (a copy where other
 /// ways lead there too). The compiler shares the end of two sections whose
 /// start a branch chooses (`cond ? WaveActiveMax(x) : WaveActiveMin(x)` in
-/// a929109552ce1e84: each arm reduces up to the read of
-/// lane 32, the join reads lane 0 and restores), and a section is followed
+/// a compute program refused for `v_permlanex16_b32`: each arm reduces up
+/// to the read of lane 32, the join reads lane 0 and restores), and a section is followed
 /// within one block. Every instruction still runs once on each path. A
 /// join that is a loop header is left as it is. `Ok(None)` if nothing
 /// changes; with the instructions copied into the arms otherwise, or as

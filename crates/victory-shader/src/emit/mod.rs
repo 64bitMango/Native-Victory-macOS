@@ -488,8 +488,8 @@ pub fn translate_program(
     // section in one block ([`ir::whole_sections`]), where the simulation
     // follows it. The original's result if that does not translate. Tried
     // for a program that translates too where it permutes lanes outside the
-    // sections followed (`v_permlanex16_b32` before the jump, in a929109552ce1e84):
-    // such a permute lowered on its own reads the lanes the host has as they
+    // sections followed (`v_permlanex16_b32` before the jump, as in a
+    // compute program refused for it): such a permute lowered on its own reads the lanes the host has as they
     // are, where the console's section reads every lane, a lane outside the
     // saved mask with the reduction's identity. After
     // darkworldhm/victory-fork-darkworldhm.
@@ -873,7 +873,7 @@ mod tests {
     /// A branch on s0 picks a wave maximum or minimum, and the two
     /// reductions share their end: each arm saves EXEC and reduces up to
     /// the read of lane 32, the join reads lane 0 and restores EXEC (as in
-    /// a929109552ce1e84). After darkworldhm/victory-fork-darkworldhm's test
+    /// a compute program refused for `v_permlanex16_b32`). After darkworldhm/victory-fork-darkworldhm's test
     /// of the paired form. `victory-gpu`'s
     /// `a_reduction_a_branch_picks_gives_each_lane_its_value_on_metal` runs
     /// the same program.
