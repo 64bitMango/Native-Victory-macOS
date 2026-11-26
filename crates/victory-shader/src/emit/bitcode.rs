@@ -9,6 +9,8 @@ use std::collections::HashMap;
 
 use crate::structure::Map;
 
+pub mod opt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 
@@ -593,6 +595,34 @@ impl Module {
             .filter(|&&i| plan.live[i as usize])
             .filter(|&&i| matches!(self.insts[i as usize].op, Op::Call(f, _) if self.funcs[f as usize].name == name))
             .count()
+    }
+
+    /// The arguments of the calls [`Self::written_calls`] counts, each an
+    /// integer where it is a constant or a sum of them (32-bit, wrapping):
+    /// what a test needs of the offsets the calls read.
+    #[cfg(test)]
+    pub fn written_call_args(&self, name: &str) -> Vec<Vec<Option<u32>>> {
+        fn value(m: &Module, v: V) -> Option<u32> {
+            match v {
+                V::Const(_) => m.int_value(v).map(|x| x as u32),
+                V::Inst(i) => match m.insts[i as usize].op {
+                    Op::Bin(Bin::Add, a, b) => Some(value(m, a)?.wrapping_add(value(m, b)?)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        let plan = self.plan();
+        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
+        calls
+            .filter(|&&i| plan.live[i as usize])
+            .filter_map(|&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == name => {
+                    Some(args.iter().map(|&a| value(self, a)).collect())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// The globals and functions [`Module::write`] declares, each kept

@@ -85,6 +85,10 @@ pub(crate) struct Lowered {
     /// Whether the DXIL holds the group-shared array host waves exchange in.
     #[cfg(test)]
     pub exchanges: bool,
+    /// `rawBufferLoad` calls in the DXIL: the offset each reads at (where
+    /// a constant) and the mask of the dwords it reads.
+    #[cfg(test)]
+    pub raw_loads: Vec<(Option<u32>, Option<u32>)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -987,6 +991,12 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
+            for (k, x) in self.raw_dwords(h, off, n).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         for k in 0..n {
             let x = match sub {
                 None => {
@@ -1590,6 +1600,13 @@ impl<'a> Lower<'a> {
             barriers: self.s.m.written_calls("dx.op.barrier"),
             #[cfg(test)]
             exchanges: self.s.xchg_used(),
+            #[cfg(test)]
+            // (opcode, handle, offset, element, mask, alignment)
+            raw_loads: (self.s.m)
+                .written_call_args("dx.op.rawBufferLoad.f32")
+                .into_iter()
+                .map(|a| (a[2], a[4]))
+                .collect(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5275,6 +5292,80 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether the dwords of one console load are read by one call for up
+    /// to four of them (`bitcode::opt::WIDE` of `VICTORY_SHADER_OPT`), not
+    /// by a call each.
+    fn wide_loads() -> bool {
+        #[cfg(test)]
+        if let Some(on) = tests::WIDE_LOADS.with(std::cell::Cell::get) {
+            return on;
+        }
+        super::shader_opt() & super::bitcode::opt::WIDE != 0
+    }
+
+    /// `count` dwords from byte `addr` on of the raw view `h`, as integers,
+    /// read in the current block by one call for every four of them
+    /// ([`Self::wide_loads`]). They are the dwords of ONE console load,
+    /// which the console reads as one (address plus 4, 8, ... without
+    /// wrapping at 32 bits): the same bytes as a call a dword reads. Loads
+    /// of different console instructions are never joined: the program
+    /// computes their offsets in 32-bit registers, and `x - 4` and `x` at
+    /// `x = 0` are one dword out of the view and its first one, where one
+    /// call from `x - 4` on would read both out of it. The console answers
+    /// each dword past the view's end with zero; so does the host for a call
+    /// that reaches past it, dword by dword (`bitcode::opt::WIDE`). After
+    /// fxceless/victory-fork c36971b2.
+    ///
+    /// A call a dword reads dword `k` at `addr + 4k`, wrapping at 32 bits
+    /// (`0xffff_fffc` plus 4 is 0); what one call for four does past 32 bits
+    /// is up to the host. So each group of four is one call only where its
+    /// offset, `addr + 4 * first` as the per-dword reads add it, is a
+    /// constant whose bytes all lie below 2^32; anywhere else (an offset
+    /// computed at run time, whose bounds the lowering does not know, or
+    /// one that wraps) its dwords are read a call each, as with the bit off.
+    fn raw_dwords(&mut self, h: V, addr: V, count: u32) -> Vec<V> {
+        let c = self.cur;
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let base = self.s.m.int_value(addr).map(|x| x as u32);
+        let mut out = Vec::with_capacity(count as usize);
+        let mut read = |l: &mut Self, a: V, n: u32| {
+            let mask = l.s.m.i8((1u8 << n) - 1);
+            let r = l.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                l.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            for k in 0..n {
+                let x = l.s.m.extract(c, r, k);
+                out.push(l.as_int(x));
+            }
+        };
+        for first in (0..count).step_by(4) {
+            let n = (count - first).min(4);
+            let start = base.map(|b| b.wrapping_add(4 * first));
+            if start.is_some_and(|s| u64::from(s) + u64::from(4 * n) <= 1 << 32) {
+                let a = match first {
+                    0 => addr,
+                    _ => {
+                        let off = self.s.m.i32(4 * first);
+                        self.s.m.bin(c, Bin::Add, addr, off)
+                    }
+                };
+                read(self, a, n);
+                continue;
+            }
+            for k in first..first + n {
+                let off = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(c, Bin::Add, addr, off);
+                read(self, a, 1);
+            }
+        }
+        out
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -5375,6 +5466,12 @@ impl<'a> Lower<'a> {
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
             let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
+            if count > 1 && Self::wide_loads() {
+                for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             let c = self.cur;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -13307,6 +13404,124 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    thread_local! {
+        /// `Lower::wide_loads` for lowerings on this thread, whatever
+        /// `VICTORY_SHADER_OPT` says; `None` leaves it to the variable.
+        pub(super) static WIDE_LOADS: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// `s_buffer_load_dword<x4|x8|x16>` (by `count`) at byte `offset` (the
+    /// immediate) of a raw SRV at table dword 0 (s0), each dword stored to
+    /// the raw UAV at table dword 4 so all are read, lowered with
+    /// `VICTORY_SHADER_OPT` bit 64 `wide`: the SRV's `rawBufferLoad` calls,
+    /// as their offset and mask.
+    fn scalar_load_raw_loads(
+        count: u32,
+        offset: i32,
+        wide: bool,
+    ) -> Vec<(Option<u32>, Option<u32>)> {
+        let op = match count {
+            4 => 10,
+            8 => 11,
+            16 => 12,
+            _ => unreachable!(),
+        };
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF400_0404 | (op << 18),
+            0xFA00_0000 | (offset as u32 & 0x1F_FFFF), // s_buffer_load_dword<x4|x8|x16> s[16:..], s[8:11], <offset>
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        for k in 0..count {
+            words.extend([
+                0x7E02_0210 + k,     // v_mov_b32 v1, s<16 + k>
+                0xE070_0000 | (4 * k), // buffer_store_dword v1, off, s[12:15], 0 offset:<4k>
+                0x8003_0100,
+            ]);
+        }
+        words.push(S_ENDPGM);
+        let view = |kind, table_offset_dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        WIDE_LOADS.with(|w| w.set(Some(wide)));
+        let l = lower_with(
+            &words,
+            vec![root(RootType::Table, 0, 0)],
+            vec![view(ResourceType::Srv, 0), view(ResourceType::Uav, 4)],
+        );
+        WIDE_LOADS.with(|w| w.set(None));
+        l.unwrap().raw_loads
+    }
+
+    /// The offset of every dword `calls` (as [`scalar_load_raw_loads`]
+    /// gives them) read, in order.
+    fn dword_offsets(calls: &[(Option<u32>, Option<u32>)]) -> Vec<u32> {
+        calls
+            .iter()
+            .flat_map(|&(at, mask)| {
+                let (at, mask) = (at.unwrap(), mask.unwrap());
+                (0..4)
+                    .filter(move |k| mask >> k & 1 != 0)
+                    .map(move |k| at.wrapping_add(4 * k))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_dwords_of_one_scalar_load_are_read_four_a_call_with_bit_64() {
+        for count in [4, 8, 16] {
+            assert_eq!(
+                scalar_load_raw_loads(count, 0, true).len(),
+                count as usize / 4,
+                "s_buffer_load of {count} dwords, bit 64 on"
+            );
+            assert_eq!(
+                scalar_load_raw_loads(count, 0, false).len(),
+                count as usize,
+                "s_buffer_load of {count} dwords, bit 64 off"
+            );
+        }
+    }
+
+    /// A load whose dwords wrap past 32 bits (`0xffff_fffc` plus 4 is 0 for
+    /// a call a dword; one call for four leaves it to the host): the group
+    /// of four that wraps is read a dword a call, at the offsets the
+    /// lowering without bit 64 reads; the groups after it, and a load whose
+    /// last dword is at `0xffff_fffc`, still four a call.
+    #[test]
+    fn a_scalar_load_wrapping_past_32_bits_is_read_a_dword_a_call() {
+        // (dwords, the calls bit 64 makes)
+        for (count, calls) in [(4, 4), (8, 5), (16, 7)] {
+            let scalar = scalar_load_raw_loads(count, -4, false);
+            let wide = scalar_load_raw_loads(count, -4, true);
+            let offsets: Vec<u32> = (0..count).map(|k| (4 * k).wrapping_sub(4)).collect();
+            assert_eq!(
+                dword_offsets(&scalar),
+                offsets,
+                "{count} dwords, bit 64 off"
+            );
+            assert_eq!(dword_offsets(&wide), offsets, "{count} dwords, bit 64 on");
+            assert_eq!(wide.len(), calls, "{count} dwords, bit 64 on: {wide:x?}");
+        }
+        // Its last dword at 0xffff_fffc, its bytes below 2^32: one call.
+        let wide = scalar_load_raw_loads(4, -16, true);
+        assert_eq!(wide, [(Some(0xffff_fff0), Some(0xF))]);
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.

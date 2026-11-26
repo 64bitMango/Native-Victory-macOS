@@ -297,6 +297,42 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// How console programs are written as DXIL where several ways compute the
+/// same values: a set of `bitcode::opt` bits. `VICTORY_SHADER_OPT`:
+/// - unset or unreadable: [`bitcode::opt::DEFAULT`] (0: a dword a call).
+/// - a number (decimal or `0x` hex): those bits; 64 the dwords of one
+///   console load read four a call. `0` for none.
+///
+/// The bits are fxceless/victory-fork's; those this translator does not
+/// read are dropped. Part of the translation: the shader cache keys on it
+/// ([`translation_settings`]).
+pub fn shader_opt() -> u32 {
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// `VICTORY_SHADER_OPT`'s value; the default when it is unset or
+/// unreadable. Pure, for testing.
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+}
+
+/// The settings a translation depends on besides the container, the
+/// options and the translator's build, as bytes for a translation cache's
+/// key: the loop limit ([`loop_limit`]) and [`shader_opt`].
+pub fn translation_settings() -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&loop_limit().to_le_bytes());
+    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -734,7 +770,21 @@ mod tests {
     #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{parse_loop_limit, parse_shader_opt};
+
+    #[test]
+    fn the_shader_opt_switch_parses_or_falls_back() {
+        let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
+        assert_eq!(usual, 0, "the four-dword reads are off unless asked for");
+        assert_eq!(parse_shader_opt(None), usual);
+        assert_eq!(parse_shader_opt(Some("0")), 0);
+        assert_eq!(parse_shader_opt(Some(" 64 ")), 64);
+        assert_eq!(parse_shader_opt(Some("0x40")), 64);
+        assert_eq!(parse_shader_opt(Some("31")), 0, "the fork's passes are not read here");
+        assert_eq!(parse_shader_opt(Some("95")), 64);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        assert_eq!(parse_shader_opt(Some("on")), usual);
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
