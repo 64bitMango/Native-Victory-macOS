@@ -65,6 +65,24 @@ const MISSES: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// Every lane: the four dwords at `s[0:1]` (`global_load_dwordx4`) stored to `s[2:3] + 16 × tid`.
+const FOUR: &[u32] = &[
+    0x7E02_0280, // v_mov_b32_e32 v1, 0
+    0xDC38_8000,
+    0x0200_0001, // global_load_dwordx4 v[2:5], v1, s[0:1]
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x340C_0084, // v_lshlrev_b32_e32 v6, 4, v0
+    0xDC70_8000,
+    0x0002_0206, // global_store_dword v6, v2, s[2:3]
+    0xDC70_8004,
+    0x0002_0306, // global_store_dword v6, v3, s[2:3] offset:4
+    0xDC70_8008,
+    0x0002_0406, // global_store_dword v6, v4, s[2:3] offset:8
+    0xDC70_800C,
+    0x0002_0506, // global_store_dword v6, v5, s[2:3] offset:12
+    0xBF81_0000, // s_endpgm
+];
+
 /// A 64-lane compute shader whose user SGPRs `s0..s<sgprs>` are root constants, translated the way
 /// the host translates, from machine code of our own in a container of no parts.
 fn shader(words: &[u32], sgprs: u32) -> HostShader {
@@ -347,6 +365,34 @@ fn memory_no_pool_shows_reads_zero_and_drops_writes() {
         assert_eq!(f.get(0xB_0000, 64), [CANARY; 64]);
         assert_eq!(f.get(0, 64), [CANARY; 64]);
     }
+}
+
+/// A four-dword load whose last two dwords lie past the end of its pool's view reads those as zero
+/// and the two before them as they are, as the console reads them. With `VICTORY_SHADER_OPT=64` (off
+/// by default) the four are one call of the translation, and this is how the converter's
+/// bounds-checked view answers that call; unset, it checks the call a dword. Run it with each.
+#[test]
+fn a_four_dword_load_past_its_views_end_reads_zero_for_those_dwords_alone() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    // The pool's last page, shown at a title address of its own: its view ends where the pool does.
+    const VA_C: u64 = 0x30_0000_0000;
+    let last = POOL - 0x1_0000;
+    t.host.memory().mapped(VA_C as usize, 0x1_0000, &f.info, last);
+    f.put(POOL - 16, &[5u32, 6, 7, 8]);
+    let cs = shader(FOUR, 4);
+    eprintln!("VICTORY_SHADER_OPT bits {}", victory_shader::emit::shader_opt());
+    let [c, d] = halves(VA_A + 0x4_0000);
+    for (back, want) in [(16, [5, 6, 7, 8]), (8, [7, 8, 0, 0])] {
+        f.put(0x6_0000, &[CANARY; 256]);
+        let [a, b] = halves(VA_C + 0x1_0000 - back);
+        dispatch(&mut t, &cs, &[a, b, c, d], false);
+        let got = f.get(0x6_0000, 256);
+        for lane in 0..64 {
+            assert_eq!(got[4 * lane..4 * lane + 4], want, "lane {lane}, {back} bytes before the end");
+        }
+    }
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 
 /// Shaders the translator marks pages in (translated without the host's option) are refused, not
