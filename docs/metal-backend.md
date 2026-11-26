@@ -673,7 +673,8 @@ inside, where the exchanges and LDS barriers then go (also in loops whose every 
 wave-wide). The branches are found from the blocks the lowering reports apart (`lower::Refused::apart`,
 `lower::branches_around`; those to the program's end last) and added until none is. Refused still: a
 scalar branch the halves meet at that tests a value they may hold differently (a join after a per-lane
-branch, or a first-lane read, which is each half's own: `lower::scalar_parting`), and groups of several
+branch, a first-lane read, which is each half's own, or a lane read of a lane so named, or of such a
+read spilled to a VGPR lane and read back: `lower::scalar_parting`, `lower::lane_read_same`), and groups of several
 console waves. `VICTORY_WAVE_WALK=0` on the native host refuses those programs as before
 (`Options::no_wave_walk`). Tests: `emit/walk_tests.rs` (refused without, 32-lane waves with), and
 `native/walk_tests.rs` in victory-gpu runs them on the GPU against the console's results.

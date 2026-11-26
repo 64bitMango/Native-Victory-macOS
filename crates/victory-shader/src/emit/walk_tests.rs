@@ -39,6 +39,10 @@ const fn vopc(op: u32, src0: u32, vsrc1: u32) -> u32 {
 const fn vop3c(op: u32, sdst: u32, src0: u32, src1: u32) -> [u32; 2] {
     [0xD400_0000 | op << 16 | sdst, src0 | src1 << 9]
 }
+/// A VOP3 instruction of two sources (`v_readlane_b32`, `v_writelane_b32`).
+const fn vop3(op: u32, dst: u32, src0: u32, src1: u32) -> [u32; 2] {
+    [0xD400_0000 | op << 16 | dst, src0 | src1 << 9]
+}
 const fn sop1(op: u32, sdst: u32, src: u32) -> u32 {
     0xBE80_0000 | sdst << 16 | op << 8 | src
 }
@@ -67,6 +71,8 @@ const V_CMP_EQ_U32: u32 = 0xC2;
 const V_CMP_GT_U32: u32 = 0xC4;
 const V_CMP_NE_U32: u32 = 0xC5;
 const V_CMPX_GT_U32: u32 = 0xD4;
+const V_READLANE: u32 = 0x360;
+const V_WRITELANE: u32 = 0x361;
 const S_MOV_B32: u32 = 0x03;
 const S_MOV_B64: u32 = 0x04;
 const S_BCNT1_B64: u32 = 0x10;
@@ -342,6 +348,43 @@ fn first_lane_return_then_count() -> Vec<u32> {
     scalar_return_then_count(&[vop1(V_READFIRSTLANE, 18, v(0))])
 }
 
+/// `s18` spilled to lane 3 of v5 and read back: what `make` left in s18.
+fn spilled_and_restored(make: &[u32]) -> Vec<u32> {
+    let mut w = make.to_vec();
+    w.extend(vop3(V_WRITELANE, 5, 18, k(3)));
+    w.extend(vop3(V_READLANE, 18, v(5), k(3)));
+    w
+}
+
+/// [`first_lane_return_then_count`] with the first lane's id spilled to a
+/// VGPR lane and read back before the branch: the read gives back the
+/// SGPR spilled, each half's own, so the halves would part as before.
+fn spilled_first_lane_return_then_count() -> Vec<u32> {
+    scalar_return_then_count(&spilled_and_restored(&[vop1(V_READFIRSTLANE, 18, v(0))]))
+}
+
+/// [`root_constant_return_then_count`] with the root constant spilled to a
+/// VGPR lane and read back before the branch: alike in both halves still.
+fn spilled_root_constant_return_then_count() -> Vec<u32> {
+    scalar_return_then_count(&spilled_and_restored(&[sop1(S_MOV_B32, 18, 0)]))
+}
+
+/// [`scalar_return_then_count`] on `v_readlane_b32 s18, v0, s18` with s18
+/// the first lane's id: each half reads the lane its own first lane names
+/// (0 and 32 on a 32-lane host), so each gets a different value.
+fn lane_by_first_lane_return_then_count() -> Vec<u32> {
+    let mut make = vec![vop1(V_READFIRSTLANE, 18, v(0))];
+    make.extend(vop3(V_READLANE, 18, v(0), 18));
+    scalar_return_then_count(&make)
+}
+
+/// [`scalar_return_then_count`] on `v_readlane_b32 s18, v0, 3`: a constant
+/// lane of a per-lane VGPR, console lane 3 in both halves (the halves
+/// exchange their lanes, `lower/halves.rs`), so both go the same way.
+fn constant_lane_return_then_count() -> Vec<u32> {
+    scalar_return_then_count(&vop3(V_READLANE, 18, v(0), k(3)))
+}
+
 /// What lane `id` stores at each dword `n` of the output, the console's
 /// result (`None`: the lane stores nothing there).
 pub(crate) type Want = fn(u32, u32) -> Option<u32>;
@@ -538,6 +581,38 @@ fn the_test_programs_are_what_their_comments_say() {
         ]
     );
     assert_eq!(
+        text(
+            &[
+                &spilled_first_lane_return_then_count()[PROLOGUE.len()..][..7],
+                &[S_ENDPGM]
+            ]
+            .concat()
+        ),
+        [
+            "v_readfirstlane_b32 s18, v0",
+            "v_writelane_b32 v5, s18, 3",
+            "v_readlane_b32 s18, v5, 3",
+            "s_lshr_b32 s18, s18, 5",
+            "s_cmp_lg_u32 s18, 0",
+            "s_endpgm",
+        ]
+    );
+    assert_eq!(
+        text(
+            &[
+                &lane_by_first_lane_return_then_count()[PROLOGUE.len()..][..4],
+                &[S_ENDPGM]
+            ]
+            .concat()
+        ),
+        [
+            "v_readfirstlane_b32 s18, v0",
+            "v_readlane_b32 s18, v0, s18",
+            "s_lshr_b32 s18, s18, 5",
+            "s_endpgm",
+        ]
+    );
+    assert_eq!(
         text(&count_after_return()[PROLOGUE.len()..]),
         [
             "v_cmpx_gt_u32 exec, 56, v0",
@@ -612,4 +687,50 @@ fn a_scalar_branch_on_a_lane_s_value_is_refused() {
     assert!(made(&root, 0, false).is_err());
     let l = made(&root, 0, true).expect("on a root constant");
     assert_eq!(wave_size(&l.dxil), 32);
+}
+
+/// A lane read is alike in both halves only when what it reads is: a
+/// first-lane id spilled with `v_writelane_b32` and read back
+/// (`Structured::restored`, the SGPR spilled) is each half's own still, and
+/// a lane named by a first-lane id is a different console lane in each
+/// half. Both are refused with the walk; a root constant spilled and read
+/// back, and a constant lane of a per-lane VGPR, are made.
+#[test]
+fn a_scalar_branch_on_a_lane_read_of_a_lane_s_value_is_refused() {
+    let mut made_anyway = Vec::new();
+    for (name, words) in [
+        (
+            "a spilled first lane",
+            spilled_first_lane_return_then_count(),
+        ),
+        (
+            "a lane by the first lane",
+            lane_by_first_lane_return_then_count(),
+        ),
+    ] {
+        assert!(made(&words, 0, false).is_err(), "{name}: without the walk");
+        match made(&words, 0, true) {
+            Ok(_) => made_anyway.push(name),
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("a scalar branch the halves may take apart"),
+                "{name}: {e}"
+            ),
+        }
+    }
+    assert!(
+        made_anyway.is_empty(),
+        "made with the walk: {made_anyway:?}"
+    );
+    for (name, words) in [
+        (
+            "a spilled root constant",
+            spilled_root_constant_return_then_count(),
+        ),
+        ("a constant lane", constant_lane_return_then_count()),
+    ] {
+        assert!(made(&words, 0, false).is_err(), "{name}: without the walk");
+        let l = made(&words, 0, true).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(wave_size(&l.dxil), 32, "{name}");
+    }
 }

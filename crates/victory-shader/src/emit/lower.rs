@@ -13108,13 +13108,16 @@ fn together_blocks(p: &Program, st: &Structured) -> Vec<bool> {
 ///   write between the two reads (the console compiler reads constants
 ///   this way). `s_memtime` and `s_memrealtime` have no DXIL form and are
 ///   refused.
-/// - `v_readlane_b32` (with an alike lane): the console lane's value,
-///   exchanged across the halves.
+/// - `v_readlane_b32` when [`lane_read_same`] holds: an SGPR spilled to a
+///   VGPR lane and read back when the SGPR spilled is alike, any other
+///   lane read when its lane is a constant or alike.
 ///
 /// Not alike: `v_readfirstlane_b32` and any other VALU result written to
-/// an SGPR (each half's own), joins not every predecessor of which both
-/// halves reach together, and anything made from those
-/// (`a_scalar_branch_on_a_lane_s_value_is_refused` in `walk_tests.rs`).
+/// an SGPR (each half's own), a lane read that [`lane_read_same`] does not
+/// take, joins not every predecessor of which both halves reach together,
+/// and anything made from those (`a_scalar_branch_on_a_lane_s_value_is_refused`
+/// and `a_scalar_branch_on_a_lane_read_of_a_lane_s_value_is_refused` in
+/// `walk_tests.rs`).
 fn wave_same(p: &Program, st: &Structured, together: &[bool]) -> Set<Value> {
     let order = crate::ir::reverse_postorder(&p.blocks);
     let scalar = |r: Reg| matches!(r, Reg::S(c) if c <= 105) || r == Reg::Scc;
@@ -13142,7 +13145,9 @@ fn wave_same(p: &Program, st: &Structured, together: &[bool]) -> Set<Value> {
                         .iter()
                         .filter(|r| r.0 != Reg::S(EXEC) && r.0 != Reg::S(EXEC + 1))
                         .all(|r| same.contains(&r.1)),
-                    Fields::Valu(_) => inst.name() == "v_readlane_b32",
+                    Fields::Valu(v) if inst.name() == "v_readlane_b32" => {
+                        lane_read_same(st, inst, v, &same)
+                    }
                     _ => false,
                 };
                 if made {
@@ -13159,6 +13164,36 @@ fn wave_same(p: &Program, st: &Structured, together: &[bool]) -> Set<Value> {
         if joins.len() == before {
             return same;
         }
+    }
+}
+
+/// Whether a `v_readlane_b32` gives both halves of a console wave the
+/// same value, given the scalars already known alike (`same`):
+///
+/// - An SGPR spilled with `v_writelane_b32` and read back at the same
+///   constant lane ([`Structured::restored`]) is made as the SGPR spilled
+///   itself, the lane never read, so it is alike exactly when that SGPR
+///   is (a first-lane read spilled and read back is each half's own still).
+/// - Any other lane read goes through group-shared memory
+///   (`lower/halves.rs`, `wide_read_lane`): every lane stores its value at
+///   its console lane's slot and each half loads the slot its lane operand
+///   names, so both halves load the same slot, and get the same value,
+///   exactly when the lane operand is the same in both: a constant, or an
+///   SGPR in `same`. A lane taken from a first-lane read names a
+///   different console lane in each half. (A group of 32 lanes or fewer
+///   has one host wave, nothing to part.)
+fn lane_read_same(st: &Structured, inst: &Inst, v: &crate::gfx10::Valu, same: &Set<Value>) -> bool {
+    if let Some(r) = inst.writes.first()
+        && let Some(s) = st.restored.get(&r.1)
+    {
+        return same.contains(s);
+    }
+    match v.src.get(1) {
+        Some(&l) if crate::resource::lane_of(l).is_some() => true,
+        Some(&Operand::Scalar { code, .. }) => {
+            inst.read(Reg::S(code)).is_some_and(|x| same.contains(&x))
+        }
+        _ => false,
     }
 }
 
