@@ -72,7 +72,19 @@ fn shader(words: &[u32], sgprs: u32) -> HostShader {
 }
 
 fn translate(words: &[u32], sgprs: u32, options: victory_shader::emit::Options) -> HostShader {
-    let native = NativeProgram {
+    let native = program(words, sgprs);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let empty = empty_container();
+    let c = Container::parse(&empty).expect("container");
+    emit_with(&c, &native, &p, &st, &io, &res, options).expect("emit")
+}
+
+/// The 64-lane compute program `words` whose user SGPRs `s0..s<sgprs>` are root constants.
+fn program(words: &[u32], sgprs: u32) -> NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
         vgprs: 16,
@@ -90,19 +102,17 @@ fn translate(words: &[u32], sgprs: u32, options: victory_shader::emit::Options) 
             threads: [64, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    // A container of no parts: `DXBC`, a digest, version 1.0, its size, no parts.
+    }
+}
+
+/// A container of no parts: `DXBC`, a digest, version 1.0, its size, no parts.
+fn empty_container() -> Vec<u8> {
     let mut empty = b"DXBC".to_vec();
     empty.extend([0; 16]);
     empty.extend([1, 0, 0, 0]);
     empty.extend(32u32.to_le_bytes());
     empty.extend(0u32.to_le_bytes());
-    let c = Container::parse(&empty).expect("container");
-    emit_with(&c, &native, &p, &st, &io, &res, options).expect("emit")
+    empty
 }
 
 fn title() -> Option<Title<Metal>> {
@@ -368,4 +378,87 @@ fn only_the_zero_copy_option_drops_the_page_marks() {
     let host = shader(COMPUTED, 4);
     assert!(host.memory && !host.memory_writes);
     assert_ne!(d3d12.dxil, host.dxil);
+}
+
+/// `cond ? WaveActiveMax(x) : WaveActiveMin(x)` as the console's compiler leaves it, in the lanes
+/// below 48 with `x` the lane number plus 1 (as a float): a branch on `s0` picks the reduction, each
+/// arm saves EXEC, sets every lane (the others take the reduction's identity) and reduces up to the
+/// read of lane 32, and the two share their end, which reads lane 0, restores EXEC and stores the
+/// result to `dst[tid]` (`s[2:3]`). The same program as `victory-shader`'s `two_reductions`, with
+/// the lanes cut to 48 and a global store.
+fn two_reductions() -> Vec<u32> {
+    let arm = |init: u32, op: u32| {
+        let mut w = vec![
+            0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+            0x7E04_02FF,
+            init, // v_mov_b32 v2, init
+            0xD501_0002,
+            0x0032_0902, // v_cndmask_b32 v2, v2, v4, s[12:13]
+        ];
+        for dpp in [0xDE54_C102, 0x9360_1202, 0x0009_2402] {
+            w.extend([op << 25 | 0x0004_04E9, dpp]); // v_<op>_f32 v2, v2, v2 dpp8
+        }
+        w.extend([
+            op << 25 | 0x0004_04FA,
+            0xFF09_4002, // v_<op>_f32 v2, v2, v2 row_mirror bound_ctrl:1
+            0xD778_0003,
+            0x0201_0102,            // v_permlanex16_b32 v3, v2, 0, 0
+            op << 25 | 0x0004_0503, // v_<op>_f32 v2, v3, v2
+            0xD760_000E,
+            0x0001_4102,            // v_readlane_b32 s14, v2, 32
+            op << 25 | 0x0004_040E, // v_<op>_f32 v2, s14, v2
+        ]);
+        w
+    };
+    let mut words = vec![
+        0x7E08_0D00, // v_cvt_f32_u32 v4, v0
+        0x0608_08F2, // v_add_f32 v4, 1.0, v4
+        0x7D88_00B0, // v_cmp_gt_u32_e32 vcc, 48, v0
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0014, // s_cbranch_scc1 to the minimum
+    ];
+    words.extend(arm(0xFF80_0000, 0x10)); // the maximum from -inf
+    words.push(0xBF82_0013); // s_branch to the join
+    words.extend(arm(0x7F80_0000, 0x0F)); // the minimum from +inf
+    words.extend([
+        0xD760_000E,
+        0x0001_0102, // v_readlane_b32 s14, v2, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0x7E0A_020E, // v_mov_b32_e32 v5, s14
+        0xDC70_8000,
+        0x0002_0501, // global_store_dword v1, v5, s[2:3]
+        0xBF81_0000, // s_endpgm
+    ]);
+    words
+}
+
+/// [`two_reductions`] translated whole, as a container is (`translate_program`, which joins the
+/// sections the jump splits), with the host's options, run on Metal: each of the 48 lanes stores
+/// the minimum 1.0 with `s0 = 0` and the maximum 48.0 otherwise; the lanes above write nothing.
+/// (On this 32-lane host the program lowered without the join gives the same values; the join is
+/// for the 64-lane D3D12 route, which this does not run.)
+#[test]
+fn a_reduction_a_branch_picks_gives_each_lane_its_value_on_metal() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let words = two_reductions();
+    let native = program(&words, 4);
+    let empty = empty_container();
+    let c = Container::parse(&empty).expect("container");
+    let cs = victory_shader::emit::translate_program(&c, &native, shaders::options()).expect("translate");
+    // What runs is the program with the sections joined, not the one lowered as it is.
+    assert_ne!(cs.dxil, shader(&words, 4).dxil, "the sections were not joined");
+    let [a, b] = halves(VA_A);
+    for (cond, want) in [(0u32, 1.0f32), (1, 48.0)] {
+        f.put(0x2_0000, &[CANARY; 64]);
+        dispatch(&mut t, &cs, &[cond, 0, a, b], false);
+        let got = f.get(0x2_0000, 64);
+        for (lane, &v) in got.iter().enumerate() {
+            let want = if lane < 48 { want.to_bits() } else { CANARY };
+            assert_eq!(v, want, "s0 = {cond}, lane {lane}: {} for {}", f32::from_bits(v), f32::from_bits(want));
+        }
+    }
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
