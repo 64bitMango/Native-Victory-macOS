@@ -240,9 +240,12 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
 
 /// What the pre-build's list holds for: the library's bytes, and what
 /// names its pipelines (the translation, as the shader cache keys it; the
-/// host descriptions).
+/// host descriptions, and the settings a translation depends on: the loop
+/// limit and the relaxed float rules).
 fn tag(blob: &[u8]) -> String {
     let limit = victory_shader::emit::loop_limit().to_le_bytes();
+    // The relaxed float rules change every translation (`VICTORY_RELAX_FLOAT`).
+    let relax = format!("{:?}", crate::shader_cache::relax());
     let translator = victory_shader::SOURCE_HASH.as_bytes();
     let mut h = blake3::Hasher::new();
     for part in [
@@ -250,6 +253,7 @@ fn tag(blob: &[u8]) -> String {
         translator,
         include_bytes!("../shader_cache.rs"),
         &limit,
+        relax.as_bytes(),
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
     ] {

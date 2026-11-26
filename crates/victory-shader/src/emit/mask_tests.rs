@@ -70,6 +70,7 @@ fn lowered(body: &[u32], lanes: u32, wave32_host: bool) -> Result<Lowered, crate
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        relax: Default::default(),
         view_marks: false,
     })
 }

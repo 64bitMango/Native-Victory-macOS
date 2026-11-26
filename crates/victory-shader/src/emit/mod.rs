@@ -436,6 +436,86 @@ pub struct Options {
     /// For the extra parameters: `copy_params[m] = n + 1` writes the values of `TEXCOORD` n to
     /// `TEXCOORD` m too (a pixel input split off one read two ways, [`HostShader::splits`]).
     pub copy_params: [u8; 32],
+    /// Console float rules left to the host's (all off: the console's).
+    pub relax: Relax,
+}
+
+/// The console's float rules a translation may leave to the host's instead
+/// ([`Options::relax`]), one kind each: the instructions that reproduce
+/// them cost GPU time (a title's 25-tap min/max filter runs in a third of
+/// the time without them), and what differs is noted per kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Relax {
+    /// Denormal operands of minimum, maximum and median, of the floor
+    /// conversions and of the output modifiers (x2, x4, /2) are no longer
+    /// read as zeros of their sign (the console's float mode; four integer
+    /// instructions an operand): the host's own treatment applies, so a
+    /// result may be a denormal (below 1.2e-38 in size) where the console
+    /// gives a zero. That is more than a zero against a denormal: a
+    /// negative denormal floors (`v_cvt_flr_i32_f32`) to -1 instead of 0,
+    /// and a denormal that survives can flip a later compare or change a
+    /// reciprocal.
+    pub denormals: bool,
+    /// Minimum and maximum of two zeros of different signs are the host's
+    /// (either zero) instead of the console's (-0 below +0; five integer
+    /// instructions an operation). Only the sign of a zero differs, but a
+    /// divide (1/-0 is -infinity) or a copysign downstream can see it.
+    pub signed_zeros: bool,
+    /// `v_mul_legacy_f32` and its multiply-adds are plain multiplies: the
+    /// console's give 0 for 0 x infinity and 0 x NaN, the host's NaN
+    /// (two compares and a select a multiply).
+    pub legacy_mul: bool,
+    /// The same multiplies as plain multiplies whose NaN and zero results
+    /// are +0 (a compare and a select): 0 x infinity and 0 x NaN stay 0 as
+    /// on the console, so no NaN is made that the console does not make,
+    /// and a zero product keeps the console's sign; a NaN operand times a
+    /// non-zero number gives 0 where the console gives NaN, and a product
+    /// of non-zero operands that underflows to -0 gives +0.
+    /// [`Relax::legacy_mul`] takes precedence.
+    pub legacy_mul_nan: bool,
+    /// 16-bit float results are rounded by the host's conversion
+    /// (`legacyF32ToF16`) instead of on the bits (about fifty integer
+    /// instructions a result): the host's rounding (toward zero on some)
+    /// and its denormal, overflow and NaN payload handling apply, so a
+    /// result may differ in the last place of an f16.
+    pub half_rounding: bool,
+    /// The median of three with a NaN among them is the host's (the console
+    /// gives the minimum of the three), and the floor conversions give the
+    /// host's 0 for a NaN (the console saturates by the NaN's sign).
+    pub nan: bool,
+}
+
+impl Relax {
+    /// The kinds named in `named`, a comma-separated list of `denormals`,
+    /// `signed_zeros`, `legacy_mul`, `legacy_mul_nan`, `half_rounding` and
+    /// `nan`, or `safe` (`denormals` and `signed_zeros`; see those fields
+    /// for what they change, which is more than a zero's sign) or `all`;
+    /// names it does not know (`exact`) are ignored.
+    pub fn named(named: &str) -> Relax {
+        let on = |kind: &str, safe: bool| {
+            named
+                .split(',')
+                .map(str::trim)
+                .any(|n| n == kind || n == "all" || (safe && n == "safe"))
+        };
+        Relax {
+            denormals: on("denormals", true),
+            signed_zeros: on("signed_zeros", true),
+            legacy_mul: on("legacy_mul", false),
+            legacy_mul_nan: on("legacy_mul_nan", false),
+            half_rounding: on("half_rounding", false),
+            nan: on("nan", false),
+        }
+    }
+
+    /// The kinds `VICTORY_RELAX_FLOAT` names ([`Relax::named`]); none
+    /// (`exact`, the console's rules) while it is unset. `safe` is opt-in:
+    /// on one recorded frame of the Wine route (D3DMetal) it saved 1-5 ms
+    /// of GPU time with the picture within the noise of two unchanged runs,
+    /// but it has not been measured on the native host.
+    pub fn from_env() -> Relax {
+        std::env::var("VICTORY_RELAX_FLOAT").map(|v| Relax::named(&v)).unwrap_or_default()
+    }
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -592,6 +672,7 @@ pub fn emit_with(
         zero_copy_memory: options.zero_copy_memory,
         rect_list: options.rect_list,
         copy_params: options.copy_params,
+        relax: options.relax,
     };
     let guessed = graphics::is_guessed(c);
     let l = match lower::lower_graphics(&parts(st, res), guessed) {

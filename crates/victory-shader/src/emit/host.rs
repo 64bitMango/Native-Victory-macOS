@@ -755,6 +755,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        relax: Default::default(),
         view_marks: false,
     })?;
     Ok(HostShader {

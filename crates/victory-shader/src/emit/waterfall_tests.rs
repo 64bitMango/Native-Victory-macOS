@@ -76,6 +76,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        relax: Default::default(),
         view_marks: false,
     })
     .expect("lower");

@@ -668,3 +668,39 @@ Verified: unit tests with synthetic programs (`emit/wave32_tests.rs`); the lower
 `metal-shaderconverter` (no IRError 6). Not measured: the 528 corpus shaders (the cache holds translated DXIL,
 not console shaders; re-translate with the option to count). Not run on the GPU: the compute backend has no
 descriptor heaps or root signatures for translator output yet.
+
+## Console float rules the host may relax (`VICTORY_RELAX_FLOAT`)
+
+The translator reproduces the console's float rules on the bits: denormal operands of min, max and median
+read as zeros, -0 ordered below +0, legacy multiplies giving 0 for 0 x infinity, 16-bit results rounded in
+integer arithmetic, the median's and the floor conversions' NaN rules. Those instructions cost GPU time
+(up to two thirds of a pass in some compute shaders measured on the Wine route).
+`emit::Options::relax` (`emit::Relax`) leaves each kind to the host's own rule: `denormals`,
+`signed_zeros`, `legacy_mul`, `legacy_mul_nan`, `half_rounding`, `nan`. Both hosts read them from
+`VICTORY_RELAX_FLOAT` (comma-separated kinds; `safe` = `denormals,signed_zeros`; `all`; `exact` for none),
+and the D3D12 host's shader cache and pipeline-library tag key on them. Unset, it is `exact`: every console
+rule is kept, and the translation is byte-identical to one without the option.
+
+`safe` is opt-in, and it changes more than which zero or denormal comes out:
+
+- `denormals` drops the flush of denormal operands before `v_cvt_flr_i32_f32`, min, max, med3 and the
+  x2, x4 and /2 output modifiers. A negative denormal then floors to -1 instead of 0, and a denormal that
+  survives can flip a later compare or give a different reciprocal.
+- `signed_zeros` lets min and max return either zero for -0 against +0. A divide (1/-0 is -infinity) or a
+  copysign downstream can see the difference.
+
+Evidence so far: on one recorded frame of the Wine route (D3DMetal), `safe` saved 1 to 5 ms of GPU time with
+the picture within the noise of two unchanged runs. Nothing has been measured on the native host. The lowering
+test (`relaxed_float_rules_leave_out_their_instructions_only`) checks which instructions each kind leaves out,
+not values. One GPU test checks values (`exact_float_rules_floor_a_negative_denormal_to_zero`, in
+`victory-gpu`'s `native/addr_tests.rs`): with `exact`, negative denormals floor to 0 through
+`v_cvt_flr_i32_f32`. On the Apple GPU it was run on, `denormals` gave 0 as well (the host flushed them), so
+that test does not tell the two apart there. Another GPU, or another route, may give -1. A second GPU test
+(`exact_float_rules_order_minus_zero_below_plus_zero_in_min_and_max`) checks the bits of `v_min_f32`,
+`v_max_f32`, `v_min_f16` and `v_max_f16` of +0 and -0 in both operand orders: with `exact`, min is -0 when
+either operand is and max is +0 unless both are. With `signed_zeros` the Apple GPU it ran on returned the
+second operand (min and max of (+0, -0) both -0, of (-0, +0) both +0), so this test does tell them apart.
+`safe` should stay
+opt-in until there are native measurements and value tests for each operation it touches.
+`legacy_mul`, `legacy_mul_nan`, `half_rounding` and `nan` change values and NaN counts: they are for
+experiments.
