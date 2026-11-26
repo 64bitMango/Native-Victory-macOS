@@ -120,6 +120,23 @@ fn narrow_waves() -> bool {
     })
 }
 
+/// The console float rules translations leave to the host's
+/// (`emit::Options::relax`, `emit::Relax::from_env`): none while
+/// `VICTORY_RELAX_FLOAT` is unset, otherwise the kinds it names (`safe`:
+/// denormals and signed zeros). Every stage takes them (the native host
+/// reads the same variable, `native::shaders`). Each combination has its
+/// own cache entries ([`host_shader`]) and pipeline-library tag.
+pub(crate) fn relax() -> victory_shader::emit::Relax {
+    static RELAX: OnceLock<victory_shader::emit::Relax> = OnceLock::new();
+    *RELAX.get_or_init(|| {
+        let relax = victory_shader::emit::Relax::from_env();
+        if relax != victory_shader::emit::Relax::default() {
+            tracing::info!(?relax, "console float rules left to the host's (VICTORY_RELAX_FLOAT)");
+        }
+        relax
+    })
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -161,6 +178,14 @@ fn options_build(locks: bool, bias: bool, narrow: bool) -> &'static [u8; 32] {
     })
 }
 
+/// `build` for translations with console float rules relaxed.
+fn relaxed_build(build: &[u8; 32], relax: &victory_shader::emit::Relax) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(format!("relaxed float rules\n{relax:?}").as_bytes());
+    *h.finalize().as_bytes()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
@@ -180,6 +205,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         rect_list: false,
         copy_params: [0; 32],
         extra_params: 0,
+        relax: relax(),
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
@@ -191,6 +217,14 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         )
     } else {
         build()
+    };
+    // Relaxed float rules: entries of their own, by the kinds relaxed.
+    let relaxed;
+    let build = if options.relax != victory_shader::emit::Relax::default() {
+        relaxed = relaxed_build(build, &options.relax);
+        &relaxed
+    } else {
+        build
     };
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),
@@ -577,6 +611,39 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    /// Each combination of relaxed float rules has its own entries, and
+    /// `VICTORY_RELAX_FLOAT` names the kinds.
+    #[test]
+    fn relaxed_float_rules_have_their_own_entries() {
+        use victory_shader::emit::Relax;
+        let none = Relax::default();
+        assert_eq!(Relax::named(""), none);
+        assert_eq!(Relax::named("exact"), none);
+        let safe = Relax::named("safe");
+        assert_eq!(safe, Relax { denormals: true, signed_zeros: true, ..none });
+        assert_eq!(Relax::named("signed_zeros, denormals"), safe);
+        assert_eq!(Relax::named("safe,half_rounding"), Relax { half_rounding: true, ..safe });
+        let all = Relax::named("all");
+        assert_eq!(
+            all,
+            Relax {
+                denormals: true,
+                signed_zeros: true,
+                legacy_mul: true,
+                legacy_mul_nan: true,
+                half_rounding: true,
+                nan: true
+            }
+        );
+        let one = Relax::named("half_rounding");
+        assert_eq!(one, Relax { half_rounding: true, ..none });
+        let base = [7u8; 32];
+        let keys = [relaxed_build(&base, &safe), relaxed_build(&base, &all), relaxed_build(&base, &one)];
+        assert!(keys.iter().all(|k| *k != base));
+        assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2]);
+        assert_ne!(relaxed_build(&[8u8; 32], &safe), keys[0]);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

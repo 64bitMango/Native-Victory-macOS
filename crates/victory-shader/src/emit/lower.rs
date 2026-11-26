@@ -120,6 +120,8 @@ pub(crate) struct Parts<'a> {
     pub rect_list: bool,
     /// See [`Options::copy_params`](super::Options).
     pub copy_params: [u8; 32],
+    /// See [`Options::relax`](super::Options).
+    pub relax: super::Relax,
 }
 
 enum Stop {
@@ -2648,6 +2650,9 @@ impl<'a> Lower<'a> {
     /// A 32-bit denormal as the console's float mode reads it: a zero of its
     /// sign, decided on the bits (the host's own denormal mode varies).
     fn ftz(&mut self, f: V) -> V {
+        if self.x.relax.denormals {
+            return f;
+        }
         let c = self.cur;
         let x = self.as_int(f);
         let (exp, sign, zero) = (
@@ -2675,6 +2680,9 @@ impl<'a> Lower<'a> {
     fn max_min_flushed(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
+        if self.x.relax.signed_zeros {
+            return r;
+        }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
         let either = self.s.m.bin(c, Bin::Or, ia, ib);
         let magnitude = self.s.m.i32(0x7FFF_FFFF);
@@ -2707,6 +2715,12 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
+        if self.x.relax.half_rounding {
+            let i32t = self.s.t.i32;
+            return self
+                .s
+                .op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+        }
         let rtz = self.mode16 == Some(3);
         let c = self.cur;
         let x = self.as_int(f);
@@ -2846,6 +2860,9 @@ impl<'a> Lower<'a> {
         let hi = self.max_min_flushed(true, a, b);
         let t = self.max_min_flushed(false, hi, third);
         let median = self.max_min_flushed(true, lo, t);
+        if self.x.relax.nan {
+            return median;
+        }
         let least = self.max_min_flushed(false, lo, third);
         let ab = self.s.m.cmp(c, pred::UNO, a, b);
         let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
@@ -2931,7 +2948,15 @@ impl<'a> Lower<'a> {
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        if self.x.relax.legacy_mul {
+            return m;
+        }
         let zero = self.s.m.f32(0);
+        if self.x.relax.legacy_mul_nan {
+            // Ordered and not zero: a NaN or zero product is +0.
+            let number = self.s.m.cmp(c, pred::ONE, m, zero);
+            return self.s.m.select(c, number, m, zero);
+        }
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
@@ -3924,12 +3949,16 @@ impl<'a> Lower<'a> {
                 let k = self.s.m.f32(factor.to_bits());
                 let r = self.ftz(f);
                 let r = self.s.m.bin(c, Bin::Mul, r, k);
-                let x = self.as_int(r);
-                let (exp, zero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0));
-                let e = self.s.m.bin(c, Bin::And, x, exp);
-                let tiny = self.s.m.cmp(c, pred::EQ, e, zero);
-                let x = self.s.m.select(c, tiny, zero, x);
-                f = self.as_float(x);
+                f = if self.x.relax.denormals {
+                    r
+                } else {
+                    let x = self.as_int(r);
+                    let (exp, zero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0));
+                    let e = self.s.m.bin(c, Bin::And, x, exp);
+                    let tiny = self.s.m.cmp(c, pred::EQ, e, zero);
+                    let x = self.s.m.select(c, tiny, zero, x);
+                    self.as_float(x)
+                };
             }
         }
         if v.clamp {
@@ -7970,7 +7999,7 @@ impl<'a> Lower<'a> {
                     Cast::FpToSi
                 };
                 let mut r = self.s.m.cast(c, op, a, self.s.t.i32);
-                if floor {
+                if floor && !self.x.relax.nan {
                     // These saturate a NaN by its sign (measured on RDNA2).
                     let xi = self.as_int(x);
                     let zero = self.s.m.i32(0);
@@ -13082,6 +13111,7 @@ mod tests {
             zero_copy_memory: false,
             rect_list: false,
             copy_params: [0; 32],
+            relax: Default::default(),
             view_marks: false,
         })
         .map(|_| ())
@@ -13140,6 +13170,7 @@ mod tests {
             zero_copy_memory: false,
             rect_list: false,
             copy_params: [0; 32],
+            relax: Default::default(),
             view_marks: false,
         })
     }
@@ -13343,6 +13374,7 @@ mod tests {
             zero_copy_memory: false,
             rect_list: false,
             copy_params: [0; 32],
+            relax: Default::default(),
             view_marks: false,
         })
         .unwrap();
@@ -14264,6 +14296,17 @@ mod tests {
 
     /// The same program, lowered.
     fn lowered(words: &[u32], lanes: u32, narrow_waves: bool, wave32_host: bool) -> super::Lowered {
+        lowered_with(words, lanes, narrow_waves, wave32_host, Default::default())
+    }
+
+    /// The same, with console float rules relaxed.
+    fn lowered_with(
+        words: &[u32],
+        lanes: u32,
+        narrow_waves: bool,
+        wave32_host: bool,
+        relax: crate::emit::Relax,
+    ) -> super::Lowered {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -14298,9 +14341,53 @@ mod tests {
             zero_copy_memory: false,
             rect_list: false,
             copy_params: [0; 32],
+            relax,
             view_marks: false,
         })
         .expect("lower")
+    }
+
+    /// Each kind of [`Relax`](crate::emit::Relax) leaves out the
+    /// instructions of its own rule and no others: a program with the
+    /// operation is shorter under the kinds named, the same under the rest.
+    #[test]
+    fn relaxed_float_rules_leave_out_their_instructions_only() {
+        use crate::emit::Relax;
+        // VOP3 `op v1, v0, v0, v0`, its result stored to LDS.
+        let program = |op: u32| {
+            let mut w = vec![0x35 << 26 | op << 16 | 1, 0x100 | 0x100 << 9 | 0x100 << 18];
+            w.extend(DS_WRITE_V1_V0);
+            w.push(S_ENDPGM);
+            w
+        };
+        let none = Relax::default();
+        let kinds: [(&str, Relax); 6] = [
+            ("denormals", Relax { denormals: true, ..none }),
+            ("signed_zeros", Relax { signed_zeros: true, ..none }),
+            ("legacy_mul", Relax { legacy_mul: true, ..none }),
+            ("legacy_mul_nan", Relax { legacy_mul_nan: true, ..none }),
+            ("half_rounding", Relax { half_rounding: true, ..none }),
+            ("nan", Relax { nan: true, ..none }),
+        ];
+        let cases: [(&str, u32, &[&str]); 5] = [
+            ("v_max_f32", 0x110, &["denormals", "signed_zeros"]),
+            ("v_mul_legacy_f32", 0x107, &["legacy_mul", "legacy_mul_nan"]),
+            ("v_mul_f16", 0x135, &["half_rounding"]),
+            ("v_med3_f32", 0x157, &["denormals", "signed_zeros", "nan"]),
+            ("v_cvt_flr_i32_f32", 0x18D, &["denormals", "nan"]),
+        ];
+        for (name, op, shorter) in cases {
+            let w = program(op);
+            let exact = lowered_with(&w, 64, false, false, none).dxil;
+            for (kind, relax) in kinds {
+                let relaxed = lowered_with(&w, 64, false, false, relax).dxil;
+                if shorter.contains(&kind) {
+                    assert!(relaxed.len() < exact.len(), "{name} under {kind}: {} against {}", relaxed.len(), exact.len());
+                } else {
+                    assert!(relaxed == exact, "{name} changed under {kind}");
+                }
+            }
+        }
     }
 
     #[test]

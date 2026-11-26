@@ -25,8 +25,24 @@ pub fn options() -> Options {
     Options {
         wave32_host: true,
         zero_copy_memory: true,
+        // Console float rules left to the host's: `VICTORY_RELAX_FLOAT`.
+        relax: relax(),
         ..Options::default()
     }
+}
+
+/// The console float rules the native host's translations leave to Metal's
+/// (`victory_shader::emit::Relax::from_env`: none unless
+/// `VICTORY_RELAX_FLOAT` names some, e.g. `safe`), read once.
+fn relax() -> victory_shader::emit::Relax {
+    static RELAX: std::sync::OnceLock<victory_shader::emit::Relax> = std::sync::OnceLock::new();
+    *RELAX.get_or_init(|| {
+        let relax = victory_shader::emit::Relax::from_env();
+        if relax != victory_shader::emit::Relax::default() {
+            tracing::info!(?relax, "console float rules left to the host's (VICTORY_RELAX_FLOAT)");
+        }
+        relax
+    })
 }
 
 /// A console shader container as DXIL for the native host.

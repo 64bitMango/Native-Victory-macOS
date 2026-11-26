@@ -507,4 +507,125 @@ fn a_reduction_a_branch_picks_gives_each_lane_its_value_on_metal() {
         }
     }
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+
+/// Every lane: `dst[tid] = v_cvt_flr_i32_f32(src[tid])`. `s[0:1]` is `src`, `s[2:3]` is `dst`.
+const FLOORS: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0xDC30_8000,
+    0x0200_0001, // global_load_dword v2, v1, s[0:1]
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x7E04_1B02, // v_cvt_flr_i32_f32_e32 v2, v2
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+/// The console's float rules by value, on the GPU: with none relaxed (`VICTORY_RELAX_FLOAT`
+/// unset, `exact`), a denormal operand of a floor conversion reads as a zero of its sign, so a
+/// negative denormal floors to 0, not -1. `denormals` leaves that to the host, which may give -1.
+#[test]
+fn exact_float_rules_floor_a_negative_denormal_to_zero() {
+    use victory_shader::emit::{Options, Relax};
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let src: [u32; 8] = [
+        0x8000_0001, // the smallest negative denormal
+        0x807F_FFFF, // the largest negative denormal
+        0x0000_0001, // a positive denormal
+        0x8080_0000, // the smallest negative normal: -1.18e-38
+        0x8000_0000, // -0
+        (-1.5f32).to_bits(),
+        2.5f32.to_bits(),
+        (-3.0f32).to_bits(),
+    ];
+    let exact: [u32; 8] = [0, 0, 0, -1i32 as u32, 0, -2i32 as u32, 2, -3i32 as u32];
+    let [a, b] = halves(VA_A);
+    let [c, d] = halves(VA_A + 0x4_0000);
+    let mut results = vec![];
+    for relax in [Relax::default(), Relax { denormals: true, ..Relax::default() }] {
+        let cs = translate(FLOORS, 4, Options { relax, ..shaders::options() });
+        f.put(0x2_0000, &src);
+        f.put(0x6_0000, &[CANARY; 8]);
+        dispatch(&mut t, &cs, &[a, b, c, d], false);
+        results.push(f.get(0x6_0000, 8));
+    }
+    assert_eq!(results[0], exact, "exact");
+    // Relaxed, only the negative denormals may differ, and only by flooring to -1.
+    let relaxed = &results[1];
+    assert_eq!(relaxed[2..], exact[2..], "relaxed, past the negative denormals");
+    assert!(relaxed[..2].iter().all(|&r| r == 0 || r == -1i32 as u32), "relaxed: {relaxed:x?}");
+    eprintln!("relaxed denormals on this GPU: {:?}", relaxed[..2].iter().map(|&r| r as i32).collect::<Vec<_>>());
+}
+
+/// Every lane: `(a, b) = src[2 tid..]`, `dst[4 tid..] = (v_min_f32 a, b; v_max_f32 a, b; v_min_f16
+/// a, b; v_max_f16 a, b)`. `s[0:1]` is `src`, `s[2:3]` is `dst`.
+const MIN_MAX: &[u32] = &[
+    0x3402_0083, // v_lshlrev_b32_e32 v1, 3, v0
+    0xDC34_8000,
+    0x0200_0001, // global_load_dwordx2 v[2:3], v1, s[0:1]
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x1E08_0702, // v_min_f32_e32 v4, v2, v3
+    0x200A_0702, // v_max_f32_e32 v5, v2, v3
+    0x740C_0702, // v_min_f16_e32 v6, v2, v3
+    0x720E_0702, // v_max_f16_e32 v7, v2, v3
+    0x3402_0084, // v_lshlrev_b32_e32 v1, 4, v0
+    0xDC78_8000,
+    0x0002_0401, // global_store_dwordx4 v1, v[4:7], s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+/// The console's float rules on the bits, on the GPU: with none relaxed (`exact`), the minimum and
+/// maximum of a +0 and a -0 order -0 below +0 in either operand order (RDNA2 ISA, `v_max_f32`; the
+/// translator's `max_min_flushed`): min gives -0 (`0x8000_0000`) when either is -0, max gives +0
+/// unless both are. The same for the f16 forms, on the low half (`0x8000`). `signed_zeros` leaves
+/// that to the host, which may give either zero; it is printed, not checked.
+#[test]
+fn exact_float_rules_order_minus_zero_below_plus_zero_in_min_and_max() {
+    use victory_shader::emit::{Options, Relax};
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    const P: u32 = 0x0000_0000;
+    const N: u32 = 0x8000_0000;
+    const PH: u32 = 0x0000;
+    const NH: u32 = 0x8000;
+    // (a, b): lanes 0 to 3 as f32 bits, lanes 4 to 7 the same as f16 bits in the low half.
+    let pairs: [(u32, u32); 4] = [(P, N), (N, P), (N, N), (P, P)];
+    let mut src = vec![];
+    for (a, b) in pairs {
+        src.extend([a, b]);
+    }
+    for (a, b) in pairs {
+        src.extend([a >> 16, b >> 16]);
+    }
+    // (min, max) of each pair.
+    let want32: [(u32, u32); 4] = [(N, P), (N, P), (N, N), (P, P)];
+    let want16: [(u32, u32); 4] = [(NH, PH), (NH, PH), (NH, NH), (PH, PH)];
+    let [a, b] = halves(VA_A);
+    let [c, d] = halves(VA_A + 0x4_0000);
+    let mut results = vec![];
+    for relax in [Relax::default(), Relax { signed_zeros: true, ..Relax::default() }] {
+        let cs = translate(MIN_MAX, 4, Options { relax, ..shaders::options() });
+        f.put(0x2_0000, &src);
+        f.put(0x6_0000, &[CANARY; 32]);
+        dispatch(&mut t, &cs, &[a, b, c, d], false);
+        let r = f.get(0x6_0000, 32);
+        // Per pair: f32 (min, max) from lanes 0 to 3, f16 (min, max) from lanes 4 to 7.
+        let got32: Vec<(u32, u32)> = (0..4).map(|i| (r[4 * i], r[4 * i + 1])).collect();
+        let got16: Vec<(u32, u32)> =
+            (4..8).map(|i| (r[4 * i + 2] & 0xFFFF, r[4 * i + 3] & 0xFFFF)).collect();
+        results.push((got32, got16));
+    }
+    let (exact32, exact16) = &results[0];
+    for (i, (a, b)) in pairs.iter().enumerate() {
+        assert_eq!(exact32[i], want32[i], "exact f32 min, max of {a:#010x}, {b:#010x}");
+        let (ah, bh) = (a >> 16, b >> 16);
+        assert_eq!(exact16[i], want16[i], "exact f16 min, max of {ah:#06x}, {bh:#06x}");
+    }
+    let (relaxed32, relaxed16) = &results[1];
+    let zero32 = |v: u32| v == P || v == N;
+    let zero16 = |v: u32| v == PH || v == NH;
+    assert!(relaxed32.iter().all(|&(m, x)| zero32(m) && zero32(x)), "relaxed f32: {relaxed32:x?}");
+    assert!(relaxed16.iter().all(|&(m, x)| zero16(m) && zero16(x)), "relaxed f16: {relaxed16:x?}");
+    eprintln!("signed zeros relaxed on this GPU: f32 {relaxed32:x?}, f16 {relaxed16:x?}");
+    eprintln!("exact: f32 {exact32:x?}, f16 {exact16:x?}");
 }

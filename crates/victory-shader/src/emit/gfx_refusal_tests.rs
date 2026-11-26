@@ -158,7 +158,7 @@ pub(super) fn computed_subword_test_shader(op: u32, bounds: u32) -> super::HostS
         inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0,
         atomic_locks: false, bias_as_gradients: false, narrow_waves: false,
         wave32_host: false, zero_copy_memory: true, view_marks: false,
-        rect_list: false, copy_params: [0; 32],
+        rect_list: false, copy_params: [0; 32], relax: Default::default(),
     }).unwrap();
     super::HostShader {
         stage: HwStage::Cs, dxil: l.dxil, splits: l.splits, table_entries: l.table_entries,
@@ -248,6 +248,7 @@ fn lower_ps(
         view_marks: false,
         rect_list: false,
         copy_params: [0; 32],
+        relax: Default::default(),
     })
 }
 
@@ -291,6 +292,7 @@ fn lower_vs(
         view_marks: false,
         rect_list,
         copy_params: [0; 32],
+        relax: Default::default(),
     })
 }
 
