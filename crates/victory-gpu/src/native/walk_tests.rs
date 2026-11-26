@@ -17,8 +17,18 @@ use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootT
 use victory_shader::{Container, ShaderError, io, ir, resource, structure};
 
 /// Root constants in `s0..s7`; the output's title address in `s[6:7]`, each lane's dword at
-/// `v1` = 4 × its id.
+/// `v1` = 4 × its id. The group id follows in s8.
 const SGPRS: u32 = 8;
+
+/// Bytes of output each group has to itself: the most any program stores, 128 dwords.
+const GROUP_BYTES: usize = 512;
+
+/// Ahead of each program: its group's output, `GROUP_BYTES` × the group id past `s[6:7]`.
+const GROUP_OUTPUT: &[u32] = &[
+    0x8F09_8908, // s_lshl_b32 s9, s8, 9
+    0x8006_0906, // s_add_u32 s6, s6, s9
+    0x8207_8007, // s_addc_u32 s7, s7, 0
+];
 
 /// A count of the even lanes below 40 inside `if (id % 2 == 0)`: 20 in each even lane.
 const COUNT_IN_BRANCH: &[u32] = &[
@@ -315,8 +325,9 @@ fn programs() -> [(&'static str, &'static [u32], u32, usize, Want); 10] {
 }
 
 /// A 64-lane compute program (one console wave) translated with `options`, from machine code of
-/// our own in a container of no parts.
+/// our own in a container of no parts, behind [`GROUP_OUTPUT`] (the group id in s8).
 fn translate(words: &[u32], lds_bytes: u32, options: Options) -> Result<HostShader, ShaderError> {
+    let words = [GROUP_OUTPUT, words].concat();
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
@@ -331,7 +342,7 @@ fn translate(words: &[u32], lds_bytes: u32, options: Options) -> Result<HostShad
         }],
         used: vec![],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: (lds_bytes / 512) << 15 | SGPRS << 1,
+            rsrc2: (lds_bytes / 512) << 15 | 1 << 7 | SGPRS << 1,
             threads: [64, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -380,6 +391,10 @@ fn walked_programs_give_the_console_wave_s_results_on_the_gpu() {
     let (lo, hi) = (VA as u32, (VA >> 32) as u32);
     for (name, words, lds, dwords, want) in programs() {
         assert!(
+            dwords <= GROUP_BYTES / 4,
+            "{name}: more than a group's output"
+        );
+        assert!(
             translate(
                 words,
                 lds,
@@ -397,8 +412,8 @@ fn walked_programs_give_the_console_wave_s_results_on_the_gpu() {
             panic!("{name}: not made: {:?}", t.shaders)
         };
         // Several groups at once, so that host waves of several groups run side by side; each
-        // stores the same.
-        for groups in [1, 8] {
+        // stores the same in its own output.
+        for groups in [1u32, 8] {
             // SAFETY: the pool's own mapping, POOL bytes; the GPU is idle.
             unsafe { std::slice::from_raw_parts_mut(mem.primary.cast::<u32>(), POOL / 4) }
                 .fill(CANARY);
@@ -408,13 +423,20 @@ fn walked_programs_give_the_console_wave_s_results_on_the_gpu() {
             l.dispatch(groups, 1, 1).unwrap();
             super::run(&t.host, &[&l]);
             // SAFETY: read after the fence wait.
-            let out = unsafe { std::slice::from_raw_parts(mem.primary.cast::<u32>(), dwords) };
-            for n in 0..dwords as u32 {
-                let expect = (0..64).find_map(|id| want(id, n)).unwrap_or(CANARY);
-                assert_eq!(
-                    out[n as usize], expect,
-                    "{name}, {groups} groups, dword {n}"
-                );
+            let out = unsafe { std::slice::from_raw_parts(mem.primary.cast::<u32>(), POOL / 4) };
+            let each = GROUP_BYTES / 4;
+            for g in 0..8 {
+                for n in 0..each as u32 {
+                    let expect = (g < groups && (n as usize) < dwords)
+                        .then(|| (0..64).find_map(|id| want(id, n)))
+                        .flatten()
+                        .unwrap_or(CANARY);
+                    assert_eq!(
+                        out[g as usize * each + n as usize],
+                        expect,
+                        "{name}, {groups} groups, group {g}, dword {n}"
+                    );
+                }
             }
         }
     }
